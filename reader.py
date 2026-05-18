@@ -17,10 +17,11 @@ def read_registered_commands(context) -> Dict[str, PluginInfo]:
 
     star_names = _build_star_name_map(context)
     # 美化内置插件名
+    star_names.setdefault("main_builtin", "main (内置)")
     for handler_md in handlers:
-        plugin_id, _ = _resolve_plugin_id(handler_md.handler_full_name)
+        plugin_id, module_path = _resolve_plugin_id(handler_md.handler_full_name)
         if plugin_id not in star_names:
-            pretty = _prettify_builtin_name(plugin_id)
+            pretty = _prettify_builtin_name(module_path)
             if pretty:
                 star_names[plugin_id] = pretty
     plugins: Dict[str, PluginInfo] = {}
@@ -29,8 +30,10 @@ def read_registered_commands(context) -> Dict[str, PluginInfo]:
         plugin_id, _ = _resolve_plugin_id(handler_md.handler_full_name)
         display_name = star_names.get(plugin_id, plugin_id)
 
-        if display_name not in plugins:
-            plugins[display_name] = {
+        # 用 plugin_id（目录名）作为 key，避免 display_name 不同导致重复
+        key = plugin_id
+        if key not in plugins:
+            plugins[key] = {
                 "name": display_name,
                 "description": "",
                 "commands": [],
@@ -39,7 +42,7 @@ def read_registered_commands(context) -> Dict[str, PluginInfo]:
 
         cmd_entry = _extract_command(handler_md)
         if cmd_entry:
-            plugins[display_name]["commands"].append(cmd_entry)
+            plugins[key]["commands"].append(cmd_entry)
 
     return {k: v for k, v in plugins.items() if v["commands"]}
 
@@ -60,6 +63,10 @@ def _build_star_name_map(context) -> Dict[str, str]:
 
 def _resolve_plugin_id(handler_full_name: str) -> tuple:
     """从 handler_full_name 提取插件 ID 和模块路径"""
+    # 内置插件：所有 astrbot.builtin_stars.* 统一归为 main (内置)
+    if handler_full_name.startswith("astrbot.builtin_stars."):
+        return "main_builtin", handler_full_name
+
     parts = handler_full_name.rsplit("_", 1)
     module_path = parts[0] if len(parts) > 1 else handler_full_name
 
@@ -72,14 +79,8 @@ def _resolve_plugin_id(handler_full_name: str) -> tuple:
 
 def _prettify_builtin_name(module_path: str) -> Optional[str]:
     """将内置模块路径转为简短显示名"""
-    # astrbot.builtin_stars.builtin_commands.main → main (内置)
-    if module_path.startswith("astrbot.builtin_stars.builtin_commands."):
-        short = module_path.split(".")[-1]
-        return f"{short} (内置)"
-    # astrbot.builtin_stars.xxx → xxx (内置)
     if module_path.startswith("astrbot.builtin_stars."):
-        short = module_path.split(".")[-1]
-        return f"{short} (内置)"
+        return "main (内置)"
     return None
 
 

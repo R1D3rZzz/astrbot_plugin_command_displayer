@@ -24,50 +24,95 @@ def format_all(data: Dict[str, PluginInfo], max_commands: int = 200, fmt: str = 
     llm_count = sum(1 for v in data.values() if v.get("source") == SOURCE_LLM)
 
     lines = [
-        f"[OK] 成功获取行为列表",
+        "[OK] 成功获取行为列表",
         f"  总计: {total_commands} 个行为，{len(data)} 个插件"
         + (f"（直接读取 {direct_count} + LLM解析 {llm_count}）" if llm_count else ""),
-        "================================",
     ]
 
-    for pname, plugin in sorted(data.items()):
+    sorted_plugins = sorted(data.items())
+    for idx, (pname, plugin) in enumerate(sorted_plugins, 1):
         cmds = plugin.get("commands", [])
         if not cmds:
             continue
 
-        lines.append(f"\n[{pname}]")
+        display_name = plugin.get("name", "")
+        tag = _source_tag(plugin.get("source", ""))
+        desc = plugin.get("description", "")
+        cmd_count = len(cmds)
+
+        # 标题：优先用 display_name，如果与目录名不同则同时显示
+        if display_name and display_name != pname:
+            header = f"--- [{idx}/{len(sorted_plugins)}] {display_name} ({pname}) {tag} ---"
+        else:
+            header = f"--- [{idx}/{len(sorted_plugins)}] {pname} {tag} ---"
+
+        lines.append("")
+        lines.append(header)
+        if desc:
+            lines.append(f"  描述: {desc}")
+        lines.append(f"  共 {cmd_count} 条命令:")
+        lines.append("")
 
         for cmd in cmds[:max_commands]:
             lines.append(_fmt_cmd(cmd, fmt))
+
+    lines.append("")
+    lines.append(f"=== 共 {len(sorted_plugins)} 个插件，{total_commands} 条命令 ===")
 
     return "\n".join(lines)
 
 
 def format_plugin_list(data: Dict[str, PluginInfo]) -> str:
     """列出所有插件名称及命令数量"""
+    total_commands = sum(len(p.get("commands", [])) for p in data.values())
     lines = [
-        f"已加载 {len(data)} 个插件：",
-        "================================",
+        f"已加载 {len(data)} 个插件，共 {total_commands} 条命令：",
     ]
     for i, (pname, plugin) in enumerate(sorted(data.items()), 1):
+        display_name = plugin.get("name", "")
         tag = _source_tag(plugin.get("source", ""))
         cmd_count = len(plugin.get("commands", []))
         desc = plugin.get("description", "")
-        desc_short = f" - {desc}" if desc else ""
-        lines.append(f"  {i:>2}. {pname} {tag} ({cmd_count}条命令){desc_short}")
+        desc_short = f" | {desc}" if desc else ""
+
+        # 有 display_name 且与目录名不同则同时显示
+        if display_name and display_name != pname:
+            name_str = f"{display_name} ({pname})"
+        else:
+            name_str = pname
+
+        lines.append(f"  {i:>2}. {name_str} {tag} ({cmd_count}条){desc_short}")
+    lines.append(f"\n共 {len(data)} 个插件，{total_commands} 条命令")
     return "\n".join(lines)
 
 
 def format_plugin(name: str, plugin: PluginInfo, max_commands: int = 200, fmt: str = "detailed") -> str:
     """格式化单个插件的命令"""
+    display_name = plugin.get("name", "")
     tag = _source_tag(plugin.get("source", ""))
     desc = plugin.get("description", "")
-    lines = [f"[{name}] {tag}"]
+    cmds = plugin.get("commands", [])[:max_commands]
+    total = len(plugin.get("commands", []))
+
+    # 标题：优先用 display_name，如果与目录名不同则同时显示
+    if display_name and display_name != name:
+        title = f"{display_name} ({name})"
+    else:
+        title = name
+
+    lines = [
+        f"========== [{title}] {tag} ==========",
+    ]
     if desc:
         lines.append(f"  描述: {desc}")
+    lines.append(f"  共 {total} 条命令:")
     lines.append("")
-    for cmd in plugin.get("commands", [])[:max_commands]:
+
+    for cmd in cmds:
         lines.append(_fmt_cmd(cmd, fmt))
+
+    lines.append("")
+    lines.append(f"========== [{title}] 共 {total} 条命令 ==========")
     return "\n".join(lines)
 
 
@@ -94,10 +139,10 @@ def _fmt_cmd(cmd: CommandEntry, fmt: str = "detailed") -> str:
     alias_str = f" (别名: {', '.join(cmd['aliases'])})" if cmd.get("aliases") else ""
 
     if fmt == "simple":
-        return f"  {tag} {cmd_text}{args}{alias_str}"
+        return f"    {tag} {cmd_text}{args}{alias_str}"
     if fmt == "table":
-        return f"  | {tag} {cmd_text} | {args} | {desc} |"
-    return f"  {tag} {cmd_text}{args}{alias_str} - {desc}"
+        return f"    | {tag} {cmd_text} | {args} | {desc} |"
+    return f"    {tag} {cmd_text}{args}{alias_str} - {desc}"
 
 
 # ═══════════════════════════════════════════════════════
