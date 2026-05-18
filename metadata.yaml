@@ -1,0 +1,5 @@
+name: astrbot_plugin_command_displayer
+author: R1d3rZzz
+description: 自动获取AstrBot全部插件的命令并通过'/命令'列出。优先直接读取已注册指令，对未注册插件可选使用LLM解析README.md作为兜底方案。
+version: 1.0.0
+repo: https://github.com/yourusername/astrbot_plugin_command_displayer

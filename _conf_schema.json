@@ -1,0 +1,79 @@
+{
+  "plugin_scan_interval": {
+    "description": "插件信息扫描间隔时间（秒），控制自动刷新插件命令缓存的频率",
+    "type": "int",
+    "hint": "建议设置为300-3600秒，过短会增加系统负载，过长可能导致信息不及时",
+    "default": 3600
+  },
+  "plugins_directory": {
+    "description": "AstrBot插件目录路径，用于扫描README.md文件获取命令信息",
+    "type": "string",
+    "hint": "默认使用AstrBot的标准插件目录。如果自定义了插件存放位置，请修改此配置",
+    "default": "/AstrBot/data/plugins"
+  },
+  "cache_timeout": {
+    "description": "插件命令缓存过期时间（分钟），超过此时间将重新扫描插件目录",
+    "type": "int",
+    "hint": "设置为0表示禁用缓存，每次查询都重新扫描；建议10-60分钟",
+    "default": 30
+  },
+  "max_readme_size": {
+    "description": "最大可处理的README.md文件大小（字节），防止处理过大文件导致性能问题",
+    "type": "int",
+    "hint": "单位：字节。建议设置为1048576（1MB）以内",
+    "default": 1048576
+  },
+  "command_format": {
+    "description": "命令显示格式设置，影响/命令和/命令 插件名命令的输出样式",
+    "type": "string",
+    "hint": "可选值：简洁(simple)、详细(detailed)、表格(table)。详细模式包含更多信息",
+    "default": "detailed",
+    "options": [
+      "simple",
+      "detailed",
+      "table"
+    ]
+  },
+  "enable_llm_analysis": {
+    "description": "启用LLM分析作为兜底方案，当插件未注册到系统时使用LLM解析其README.md获取命令信息",
+    "type": "bool",
+    "hint": "关闭后将仅通过直接读取注册指令获取信息，未注册的插件不会被解析。关闭可节省LLM调用",
+    "default": true
+  },
+  "include_disabled_plugins": {
+    "description": "是否包含已禁用的插件信息，启用后将扫描所有目录而不仅限于激活的插件",
+    "type": "bool",
+    "hint": "禁用状态下的插件通常无法正常工作，但可能仍有参考命令信息",
+    "default": false
+  },
+  "fuzzy_search_threshold": {
+    "description": "模糊搜索匹配阈值，数值越低匹配越严格，越高匹配范围越广",
+    "type": "float",
+    "hint": "取值范围0.0-1.0，0.6为适中值。影响/命令 插件名命令的搜索精度",
+    "default": 0.6
+  },
+  "max_commands_per_plugin": {
+    "description": "每个插件最多显示的命令数量限制，防止输出过长影响阅读",
+    "type": "int",
+    "hint": "设置为0表示不限制。建议100-500之间",
+    "default": 200
+  },
+  "enable_auto_reload": {
+    "description": "启用自动重载机制，当检测到README.md文件变化时自动更新缓存",
+    "type": "bool",
+    "hint": "开启后会监控文件系统变化，实时更新命令信息",
+    "default": true
+  },
+  "log_level": {
+    "description": "插件日志级别，用于调试和故障排除",
+    "type": "string",
+    "hint": "DEBUG:详细日志，INFO:一般信息，WARNING:警告，ERROR:错误",
+    "default": "INFO",
+    "options": [
+      "DEBUG",
+      "INFO",
+      "WARNING",
+      "ERROR"
+    ]
+  }
+}
