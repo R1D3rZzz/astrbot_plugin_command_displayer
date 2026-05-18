@@ -57,16 +57,15 @@ graph TD
     B --> C{缓存失效?}
     C -->|是| D[扫描插件目录]
     C -->|否| E[直接使用缓存]
-    D --> F[直接读取 star_handlers_registry]
+    D --> F[读取 star_handlers_registry]
     F --> G{有注册指令?}
     G -->|是| H[提取命令信息]
     G -->|否| I[LLM 解析 README]
     H --> J[构建命令数据库]
     I --> J
     J --> K[写入缓存]
-    E --> L[提供查询接口]
+    E --> L[查询接口]
     K --> L
-    L --> M[/命令 /扫描 /全部插件]
 ```
 
 ---
