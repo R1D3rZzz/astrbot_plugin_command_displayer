@@ -1,6 +1,6 @@
 # astrbot_plugin_command_displayer
 
-> **AstrBot 插件命令中枢 · LLM 驱动 · 自动扫描**
+> **AstrBot 插件命令中枢 · LLM 驱动 · 自动扫描 · 命令路由**
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-v4.0%2B-blue)](https://github.com/Soulter/AstrBot)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
@@ -11,24 +11,31 @@
 
 **Command Displayer** 是一个**开发给~~记不住插件命令又懒得看后台的懒狗~~的插件**，用于**自动收集、解析并展示 AstrBot 中所有已安装插件的命令信息**。
 
-它通过 **LLM 解析插件 README.md**，提取命令结构，并提供统一的命令查询入口。
+核心亮点：
+
+- **LLM 命令级路由**：用自然语言描述需求，AI 直接匹配到**具体的一条命令**（而非整个插件），并可自动执行
+- **双执行模式**：`auto` 模式直接执行，`confirm` 模式先确认后执行
+- **命令输错提醒**：拼错插件名时自动提示"你是不是想找..."
+- **直接读取 + LLM 兜底**：优先读取已注册指令，未注册的插件通过 LLM 解析 README.md
 
 ---
 
 ## 核心功能
 
+**LLM 智能命令路由（核心）**
+- 用自然语言描述意图，LLM 从命令索引中匹配到**最具体的命令**（插件名 + 命令名 + 参数）
+- 支持自动执行（auto）和确认后执行（confirm）两种模式
+- 匹配结果附带命令描述，让 AI 能理解命令的语义
+
 **直接读取注册指令（优先）**
-- 从 AstrBot 的 `star_handlers_registry` 直接读取所有已注册插件的指令和行为
+- 从 AstrBot 的 `star_handlers_registry` 直接读取所有已注册插件的指令
 - 无需调用 LLM，响应即时
 - 自动提取命令名、别名、过滤器类型、描述等信息
 - 支持指令（CommandFilter）、正则（RegexFilter）、平台过滤等多种过滤器类型
 
 **LLM 智能解析 README（兜底）**
 - 当插件未注册 handler 时，通过 LLM 解析 README.md 提取命令信息
-- 自动提取：
-  - 插件名称
-  - 插件描述
-  - 命令列表（含参数说明）
+- 自动提取：插件名称、插件描述、命令列表（含参数说明和描述）
 - 兼容各种 README 写作风格
 
 **全自动扫描**
@@ -59,28 +66,62 @@ graph TD
     C -->|否| E[直接使用缓存]
     D --> F[读取 star_handlers_registry]
     F --> G{有注册指令?}
-    G -->|是| H[提取命令信息]
+    G -->|是| H[提取命令信息 + 描述]
     G -->|否| I[LLM 解析 README]
     H --> J[构建命令数据库]
     I --> J
     J --> K[写入缓存]
-    E --> L[查询接口]
+    E --> L[查询 / 路由接口]
     K --> L
+
+    L --> M[/LLM 自然语言路由]
+    L --> N[/命令 查询]
+    L --> O[/扫描 刷新]
+
+    M --> P[LLM 命令级匹配]
+    P --> Q{执行模式?}
+    Q -->|auto| R[直接注入事件队列执行]
+    Q -->|confirm| S[发送确认消息]
+    S --> T[用户回复确认]
+    T --> R
+```
+
+### LLM 命令路由流程
+
+```
+用户: /LLM 帮我查北京天气
+  ↓
+LLM 从命令索引中匹配
+  ↓
+返回: astrbot_plugin_weather | /天气 | 北京 | 匹配到天气查询命令
+  ↓
+[auto 模式]  → 注入事件队列 → /天气 北京 → 目标插件执行
+[confirm 模式] → "确认要执行 /天气 北京 吗？" → 用户回复确认 → 执行
 ```
 
 ---
 
 ## 支持的命令
 
-### `/帮助`
+### `/LLM [自然语言]`
 
-显示本插件自身的命令语法帮助。
+用自然语言描述你想做什么，AI 自动匹配最相关的**具体命令**。
+
+| 用法 | 功能 |
+|---|---|
+| `/LLM` | 显示用法帮助 |
+| `/LLM [自然语言]` | AI 匹配命令，auto 模式直接执行 / confirm 模式先确认 |
+
+示例：
+- `/LLM 查看天气的命令` → 匹配到天气插件的 `/天气` 命令
+- `/LLM 帮我查一下北京天气` → 匹配到 `/天气 北京` 并自动执行（auto 模式）
+- `/LLM 有哪些管理相关的插件` → 返回 LIST_ALL，展示所有命令
 
 ### `/命令 [子命令] [参数] [格式]`
 
 | 用法 | 功能 |
 |---|---|
-| `/命令` | 显示 `/命令` 用法帮助 |
+| `/命令` | 显示用法帮助 |
 | `/命令 all` / `/命令 全部` | 查看所有插件命令 |
 | `/命令 [插件名]` | 查看指定插件命令（支持模糊搜索） |
 | `/命令 delete all` / `/命令 delete 全部` | 删除全部记录 |
@@ -104,7 +145,7 @@ graph TD
 
 | 用法 | 功能 |
 |---|---|
-| `/扫描` | 显示 `/扫描` 用法帮助 |
+| `/扫描` | 显示用法帮助 |
 | `/扫描 all` / `/扫描 全部` | 全量扫描所有插件 |
 | `/扫描 [插件名]` | 扫描指定插件 |
 | `/扫描 add` / `/扫描 增量` | 增量扫描新增插件 |
@@ -113,28 +154,80 @@ graph TD
 
 ## 使用示例
 
-### 查看帮助
+### LLM 路由 - 匹配并执行命令
 
 ```
-/帮助
+/LLM 帮我查北京天气
+```
+
+**confirm 模式**（默认）返回示例：
+```
+匹配到 **天气插件** 的命令：`/天气 北京`
+确认要执行 `/天气 北京` 吗？
+请回复 **确认** 或 **是** 来执行，回复其他内容取消。
+（60 秒后过期）
+```
+
+用户回复 `确认` 后，插件自动模拟发送 `/天气 北京`，目标插件处理并返回结果。
+
+**auto 模式**直接返回：
+```
+✅ 匹配到 **天气插件** 的命令：`/天气 北京`
+正在执行命令 `/天气 北京`...
+```
+
+---
+
+### LLM 路由 - 仅查看命令信息
+
+```
+/LLM 查看天气的命令
 ```
 
 返回示例：
+```
+匹配到 **天气插件** 的命令：`/天气 [城市名]`
+确认要执行 `/天气` 吗？
+请回复 **确认** 或 **是** 来执行，回复其他内容取消。
+（60 秒后过期）
+```
+
+---
+
+### LLM 路由 - 查看全部命令
 
 ```
-Command Displayer 命令帮助
+/LLM 有哪些命令
+```
 
-  /命令 [子命令] [参数]
-  /命令                    — 显示本帮助
-  /命令 all / 全部          — 查看所有插件命令
-  /命令 [插件名]            — 查看指定插件命令
-  /命令 delete all / 全部   — 删除全部记录
-  /命令 delete [插件名]     — 删除指定插件记录
+返回示例：
+```
+[OK] 成功获取行为列表
+  总计: 48 个行为，6 个插件
 
-  /扫描 [子命令]
-  /扫描 all / 全部          — 全量扫描所有插件
-  /扫描 [插件名]            — 扫描指定插件
-  /扫描 add / 增量          — 增量扫描新增插件
+--- [1/6] astrbot_plugin_weather [直接] | 天气查询插件 ---
+  共 3 条命令:
+    [指令] /天气 [城市名] | 查询指定城市的天气
+    [指令] /forecast [城市名] | 查询未来几天的天气预报
+    [指令] /air [城市名] | 查询空气质量
+
+...
+=== 共 6 个插件，48 条命令 ===
+```
+
+---
+
+### LLM 路由 - 输错提醒
+
+```
+/LLM ticky
+```
+
+返回示例：
+```
+[X] 未找到插件 `ticky`
+你是不是想找：tick / tickle / dida365
+使用 /全部插件 查看所有可用插件
 ```
 
 ---
@@ -149,22 +242,17 @@ Command Displayer 命令帮助
 
 ```
 [OK] 成功获取行为列表
-  总计: 48 个行为，6 个插件
+  总计: 48 个行为，6 个插件（直接读取 5 + LLM解析 1）
 
 --- [1/6] astrbot_plugin_codemage [直接] ---
-  描述: 插件生成器
+  描述: AI代码生成插件
   共 10 条命令:
 
-    [指令] /codemage - AI代码生成插件
+    [指令] /codemage - AI代码生成
     [指令] /codemage help - 查看帮助
     ...
 
---- [2/6] Epic免费游戏提醒 (astrbot_plugin_epic_free_games_notice) [直接] ---
-  共 1 条命令:
-
-    [指令] /epic - 查看本周 Epic 免费游戏
-
---- [3/6] 滴答清单连接器 (astrbot_plugin_dida365) [直接] ---
+--- [2/6] 滴答清单连接器 (astrbot_plugin_dida365) [直接] ---
   描述: 滴答清单连接器
   共 11 条命令:
 
@@ -192,6 +280,7 @@ Command Displayer 命令帮助
 
     [指令] /dida add [内容] - 添加待办事项
     [指令] /dida list - 列出待办
+    [指令] /dida done [序号] - 完成待办
     ...
 
 ========== [滴答清单连接器 (astrbot_plugin_dida365)] 共 11 条命令 ==========
@@ -199,16 +288,18 @@ Command Displayer 命令帮助
 
 ---
 
-### 删除指定插件记录
+### 模糊搜索插件
 
 ```
-/命令 delete dida365
+/命令 dida
 ```
 
-返回示例：
+当插件名不完全匹配时，自动模糊搜索并附带输错提醒：
 
 ```
-[-] 已删除插件 `dida365` 的记录
+[X] 未找到插件 `dida`
+你是不是想找：dida365 / dida365_connector
+使用 /全部插件 查看所有可用插件
 ```
 
 ---
@@ -223,12 +314,12 @@ Command Displayer 命令帮助
 
 ```
 已加载 6 个插件，共 48 条命令：
-   1. astrbot_plugin_codemage [直接] (10条) | 插件生成器
-   2. astrbot_plugin_command_displayer [直接] (4条)
+   1. astrbot_plugin_codemage [直接] (10条) | AI代码生成插件
+   2. astrbot_plugin_command_displayer [直接] (5条)
    3. astrbot_plugin_dida365 [直接] (11条) | 滴答清单连接器
    4. astrbot_plugin_epic_free_games_notice [直接] (1条) | Epic免费游戏提醒
-   5. astrbot_plugin_zanwo [直接] (6条)
-   6. main (内置) [直接] (16条)
+   5. astrbot_plugin_weather [直接] (3条) | 天气查询插件
+   6. main (内置) [直接] (18条)
 
 共 6 个插件，48 条命令
 ```
@@ -244,8 +335,8 @@ Command Displayer 命令帮助
 返回示例：
 
 ```
-正在全量扫描插件命令，请稍候...
-全量扫描完成，共加载 12 个插件的命令
+[*] 正在全量扫描插件命令，请稍候...
+[OK] 全量扫描完成，共加载 12 个插件的命令
 ```
 
 ---
@@ -259,8 +350,8 @@ Command Displayer 命令帮助
 返回示例：
 
 ```
-正在增量扫描新增插件...
-增量扫描完成，未发现新插件
+[*] 正在增量扫描新增插件...
+[OK] 增量扫描完成，发现新插件: astrbot_plugin_new_xxx
 ```
 
 ---
@@ -274,59 +365,126 @@ Command Displayer 命令帮助
 返回示例：
 
 ```
-正在扫描插件 `dida365`...
-插件 `dida365` 扫描完成
+[*] 正在扫描插件 `dida365`...
+[OK] 插件 `dida365` 扫描完成
 ```
 
 ---
 
-## 配置项（config.json）
+### 删除缓存记录
+
+```
+/命令 delete dida365
+```
+
+返回示例：
+
+```
+[-] 已删除插件 `dida365` 的记录
+```
+
+---
+
+## 配置项
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `plugins_directory` | `/AstrBot/data/plugins` | 插件目录 |
-| `plugin_scan_interval` | `300` | 后台扫描间隔（秒） |
+| `plugins_directory` | `/AstrBot/data/plugins` | 插件目录路径 |
+| `plugin_scan_interval` | `3600` | 后台扫描间隔（秒） |
 | `cache_timeout` | `30` | 缓存有效期（分钟） |
-| `max_readme_size` | `1048576` | README 最大读取大小（字节） |
-| `max_commands_per_plugin` | `200` | 单个插件最大命令数 |
-| `command_format` | `detailed` | 默认输出格式（simple/detailed/table） |
-| `fuzzy_search_threshold` | `0.6` | 模糊搜索阈值（0.0-1.0） |
+| `max_readme_size` | `1048576` | README 最大读取大小（字节，1MB） |
+| `max_commands_per_plugin` | `200` | 单个插件最大显示命令数 |
+| `command_format` | `detailed` | 默认输出格式：`simple` / `detailed` / `table` |
+| `enable_llm_analysis` | `true` | 是否启用 LLM 解析 README（兜底方案） |
 | `enable_auto_reload` | `true` | 是否启用后台自动扫描 |
-| `enable_llm_analysis` | `true` | 是否启用 LLM 解析 README |
 | `include_disabled_plugins` | `false` | 是否包含已禁用的插件（以 `_` 开头的目录） |
-| `log_level` | `INFO` | 日志级别（DEBUG/INFO/WARNING/ERROR） |
+| `fuzzy_match_mode` | `llm` | 插件名模糊匹配模式：`fuzzy`（编辑距离）/ `llm`（LLM 路由）。仅用于 `/命令 [插件名]` |
+| `llm_execute_mode` | `confirm` | LLM 路由执行模式：`auto`（直接执行）/ `confirm`（先确认后执行） |
+| `log_level` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
+### 配置说明
+
+**`fuzzy_match_mode`**
+- `fuzzy`：使用编辑距离算法匹配插件名，无需 LLM 调用，速度快但仅支持精确的文字相似度
+- `llm`：使用 LLM 理解自然语言，支持语义匹配（如"天气插件"匹配到 `astrbot_plugin_weather`），需要配置 LLM 提供商
+
+**`llm_execute_mode`**
+- `auto`：LLM 匹配到命令后直接通过事件队列注入执行，无需用户确认
+- `confirm`：匹配到命令后先展示确认信息，用户回复"确认"/"是"后才执行（60 秒过期）
+
+---
+
+## 命令自动执行原理
+
+插件通过 **事件队列注入** 实现命令自动执行（参考 AstrBot 内置插件的 `copy + put_nowait` 模式）：
+
+1. 浅复制当前事件对象
+2. 将消息内容替换为目标命令（如 `/天气 北京`）
+3. 标记 `is_wake = True` 跳过唤醒检查
+4. 清除事件结果和停止标记
+5. 推入 AstrBot 事件队列
+6. EventBus 拾取后走完整管道处理（权限检查 → 命令解析 → 目标插件执行 → 结果返回）
+
+这意味着自动执行的命令会经过 AstrBot 的完整安全管道，与用户手动发送命令的行为完全一致。
+
+---
+
+## 文件结构
+
+```
+astrbot_plugin_command_displayer/
+├── __init__.py          # 插件入口，导出 CommandDisplayer
+├── main.py              # 核心逻辑：命令注册、LLM 路由、事件监听
+├── scanner.py           # 插件扫描器（直接读取 + LLM 解析混合）
+├── reader.py            # 从 star_handlers_registry 直接读取注册指令
+├── parser.py            # LLM 解析 README.md
+├── formatter.py         # 输出格式化 + 命令索引构建
+├── router.py            # LLM 命令级路由 + 命令自动执行
+├── cache.py             # JSON 持久化缓存
+├── models.py            # 数据模型（TypedDict）+ 常量
+├── _conf_schema.json    # AstrBot 配置面板 schema
+├── metadata.yaml        # 插件元信息
+└── README.md            # 本文档
+```
+
+---
 
 ## 依赖环境
 
 - AstrBot ≥ **v4.0**
-- 已配置 **LLM Provider**
-  - OpenAI / Azure / Ollama / 本地模型均可
-- 插件目录中存在 README.md
+- 已配置 **LLM Provider**（OpenAI / Azure / Ollama / 本地模型均可）
+- 插件目录中存在 README.md（用于 LLM 兜底解析）
 
 ---
 
 ## 常见问题
 
-### Q：为什么有的插件没显示？
+### Q：LLM 路由匹配不到命令？
+A：
+- 确保已执行 `/扫描 all` 完成初始扫描
+- 检查 LLM 提供商是否可用
+- 尝试更具体的描述，如"查询天气"而非"天气"
+
+### Q：auto 模式执行失败？
+A：
+- 目标插件的命令可能未被注册到 `star_handlers_registry`
+- 目标插件可能已被卸载或禁用
+- 插件会自动降级为展示命令文本，用户可手动发送
+
+### Q：有的插件没显示？
 A：
 - 插件目录下 **没有 README.md**
 - README 内容无法被 LLM 解析
-- LLM 返回数据不完整（已自动容错）
+- 插件未注册任何 handler 且 LLM 解析失败（已自动容错）
 
 ### Q：扫描很慢？
 A：
-- 首次扫描需要调用 LLM
+- 首次扫描需要调用 LLM 解析未注册的插件
 - 后续使用缓存，几乎瞬时响应
-
-### Q：支持自定义命令格式吗？
-A：
-- 支持任意 README 写法
-- LLM 会自动推断结构
 
 ---
 
-##  License
+## License
 
 MIT License
 

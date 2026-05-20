@@ -46,11 +46,25 @@
     "hint": "禁用状态下的插件通常无法正常工作，但可能仍有参考命令信息",
     "default": false
   },
-  "fuzzy_search_threshold": {
-    "description": "模糊搜索匹配阈值，数值越低匹配越严格，越高匹配范围越广",
-    "type": "float",
-    "hint": "取值范围0.0-1.0，0.6为适中值。影响/命令 插件名命令的搜索精度",
-    "default": 0.6
+  "fuzzy_match_mode": {
+    "description": "插件名模糊匹配模式：使用传统编辑距离或LLM进行插件名路由",
+    "type": "string",
+    "hint": "fuzzy=编辑距离算法（无需LLM调用，速度快）；llm=LLM智能路由（理解自然语言，需要LLM支持）。仅在/命令 [插件名]时使用",
+    "default": "llm",
+    "options": [
+      "fuzzy",
+      "llm"
+    ]
+  },
+  "llm_execute_mode": {
+    "description": "LLM路由执行模式：匹配到具体命令后，是直接执行还是先确认",
+    "type": "string",
+    "hint": "auto=匹配到命令后自动执行（模拟用户发送命令）；confirm=匹配到命令后先展示确认信息，用户回复确认后才执行",
+    "default": "confirm",
+    "options": [
+      "auto",
+      "confirm"
+    ]
   },
   "max_commands_per_plugin": {
     "description": "每个插件最多显示的命令数量限制，防止输出过长影响阅读",
