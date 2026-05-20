@@ -1,30 +1,41 @@
+"""Command Displayer — AstrBot 插件命令中枢
+
+核心功能：
+1. 扫描所有插件命令（直接读取 + LLM 解析 README 兜底）
+2. 生成结构化命令索引（command_index.json），包含插件/命令/参数描述
+3. LLM 命令级路由：自然语言 → 具体命令，支持 auto/confirm 执行模式
+4. 命令输错提醒：拼错时自动提示相似插件名
+"""
+
 import asyncio
 import time
 from typing import Optional
-from astrbot.api.star import Context, Star
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api import logger
 
-from .scanner import PluginScanner
+from astrbot.api import logger
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.star import Context, Star
+
 from .cache import CommandCache
-from .formatter import format_all, format_plugin, format_plugin_list, fuzzy_find
+from .formatter import format_all, format_plugin, format_plugin_list
 from .models import LOG_LEVEL_MAP
+from .router import execute_command, llm_resolve, suggest_correction
+from .scanner import PluginScanner
 
 
 class CommandDisplayer(Star):
-    """AstrBot 插件命令中枢 — 直接读取注册指令 + LLM 兜底"""
 
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         cfg = config or {}
 
-        # ── 配置 ─────────────────────────────────────
+        # ── 配置 ──────────────────────────────────
         self.plugin_scan_interval = cfg.get("plugin_scan_interval", 300)
         self.cache_timeout = cfg.get("cache_timeout", 30) * 60
         self.max_commands_per_plugin = cfg.get("max_commands_per_plugin", 200)
         self.enable_auto_reload = cfg.get("enable_auto_reload", True)
         self.command_format = cfg.get("command_format", "detailed")
-        self.fuzzy_search_threshold = cfg.get("fuzzy_search_threshold", 0.6)
+        self.fuzzy_match_mode = cfg.get("fuzzy_match_mode", "llm")
+        self.llm_execute_mode = cfg.get("llm_execute_mode", "confirm")
 
         log_level = cfg.get("log_level", "INFO")
         if hasattr(logger, "setLevel"):
@@ -44,10 +55,13 @@ class CommandDisplayer(Star):
         if self.enable_auto_reload:
             self._start_background_scan()
 
+        # ── LLM 路由待确认状态 ─────────────────────
+        self._pending_llm: dict = {}  # sender_id → {plugin_name, command_name, args, timestamp}
+
         logger.info(
             f"Command Displayer 初始化完成（格式={self.command_format}, "
-            f"自动扫描={self.enable_auto_reload}, "
-            f"LLM分析={cfg.get('enable_llm_analysis', True)}）"
+            f"扫描={self.enable_auto_reload}, 匹配={self.fuzzy_match_mode}, "
+            f"执行={self.llm_execute_mode}, LLM分析={cfg.get('enable_llm_analysis', True)}）"
         )
 
     # ── 生命周期 ──────────────────────────────────
@@ -77,7 +91,51 @@ class CommandDisplayer(Star):
     async def terminate(self):
         if self._scan_task:
             self._scan_task.cancel()
+        self._pending_llm.clear()
         logger.info("Command Displayer 插件已卸载")
+
+    # ── 插件名解析（/命令 [插件名] 用） ──────────────
+
+    async def _resolve_plugin(
+        self, query: str, data: dict, provider
+    ) -> Optional[str]:
+        """
+        根据 fuzzy_match_mode 解析插件名（仅用于 /命令 [插件名] 场景）。
+        fuzzy: 编辑距离模糊匹配
+        llm:   LLM 语义路由
+        """
+        if not data or not query:
+            return None
+        if query in data:
+            return query
+
+        if self.fuzzy_match_mode == "llm":
+            result = await llm_resolve(query, data, provider)
+            if result:
+                pname, _, _, _ = result
+                return pname if pname != "__list_all__" else None
+            return None
+
+        # fuzzy 模式：编辑距离
+        candidates = list(data.keys())
+        suggestions = suggest_correction(query, candidates, top_n=1)
+        if suggestions:
+            best = suggestions[0]
+            max_dist = max(len(query), len(best)) // 2
+            from .router import _edit_distance
+            if _edit_distance(query.lower(), best.lower()) <= max_dist:
+                return best
+        return None
+
+    def _build_not_found_message(self, query: str, data: dict) -> str:
+        """构建未找到插件时的提示消息，包含输错提醒"""
+        candidates = list(data.keys())
+        suggestions = suggest_correction(query, candidates, top_n=3)
+        msg = f"[X] 未找到插件 `{query}`"
+        if suggestions:
+            msg += f"\n你是不是想找：{' / '.join(suggestions)}"
+        msg += "\n使用 /全部插件 查看所有可用插件"
+        return msg
 
     # ── /帮助 ──────────────────────────────────────
 
@@ -86,17 +144,19 @@ class CommandDisplayer(Star):
         text = (
             "Command Displayer 命令帮助\n"
             "\n"
+            "/LLM [自然语言]             - 用自然语言描述你想做什么，AI 匹配具体命令并执行\n"
+            "  示例: /LLM 查看天气的命令\n"
+            "  示例: /LLM 帮我查一下北京天气\n"
+            "\n"
             "/命令 [子命令] [参数] [格式]\n"
             "  /命令 all / 全部          - 查看所有插件命令\n"
             "  /命令 [插件名]            - 查看指定插件命令\n"
             "  /命令 delete all / 全部   - 删除全部记录\n"
             "  /命令 delete [插件名]     - 删除指定插件记录\n"
             "\n"
-            "格式参数（可选，追加在命令末尾）\n"
-            "  -s                        - 简洁模式\n"
-            "  -d                        - 详细模式\n"
-            "  -t                        - 表格模式\n"
-            "  示例: /命令 all -t / 命令 插件名 -s\n"
+            "格式参数（可选）\n"
+            "  -s 简洁模式  -d 详细模式  -t 表格模式\n"
+            "  示例: /命令 all -t\n"
             "\n"
             "/全部插件                   - 列出所有插件名称\n"
             "\n"
@@ -127,7 +187,9 @@ class CommandDisplayer(Star):
             try:
                 provider = self.context.get_using_provider()
                 await self.scanner.scan_all(self.cache, self.context, provider)
-                yield event.plain_result(f"[OK] 全量扫描完成，共加载 {len(self.cache.commands)} 个插件的命令")
+                yield event.plain_result(
+                    f"[OK] 全量扫描完成，共加载 {len(self.cache.commands)} 个插件的命令"
+                )
             except Exception as e:
                 logger.error(f"全量扫描失败: {e}")
                 yield event.plain_result(f"[X] 扫描失败: {e}")
@@ -170,6 +232,168 @@ class CommandDisplayer(Star):
             return
         yield event.plain_result(format_plugin_list(data))
 
+    # ── /LLM ───────────────────────────────────────
+
+    @filter.command("LLM")
+    async def llm_handler(self, event: AstrMessageEvent, subcmd: str = ""):
+        """LLM 命令级路由：匹配到具体命令，支持自动执行或确认后执行"""
+        if not subcmd:
+            yield event.plain_result(
+                "/LLM [自然语言]\n"
+                "  示例: /LLM 查看天气的命令\n"
+                "  示例: /LLM 帮我查一下北京天气\n"
+                "\n"
+                "AI 会根据你的描述匹配最相关的命令。"
+            )
+            return
+
+        data = self.cache.commands
+        if not data:
+            yield event.plain_result("[X] 未找到任何插件（请先使用 /扫描）")
+            return
+
+        provider = self.context.get_using_provider()
+        if not provider:
+            yield event.plain_result("[X] 当前没有可用的 LLM 提供商")
+            return
+
+        result = await llm_resolve(subcmd, data, provider)
+        if not result:
+            yield event.plain_result(
+                f"[X] 无法理解你的意图：`{subcmd}`\n"
+                "请尝试更具体的描述，或使用 /全部插件 查看可用插件。"
+            )
+            return
+
+        plugin_name, command_name, args_str, confirm_msg = result
+
+        # 特殊：用户想看全部
+        if plugin_name == "__list_all__":
+            yield event.plain_result(
+                format_all(data, self.max_commands_per_plugin, self.command_format)
+            )
+            return
+
+        pinfo = data.get(plugin_name)
+
+        # 构建展示信息
+        display = pinfo.get("name", plugin_name) or plugin_name if pinfo else plugin_name
+        if command_name and command_name != "-":
+            cmd_show = command_name
+            if not cmd_show.startswith("/") and not cmd_show.startswith("正则:") and not cmd_show.startswith("["):
+                cmd_show = "/" + cmd_show
+            if args_str:
+                cmd_show += f" {args_str}"
+            detail = f"匹配到 **{display}** 的命令：`{cmd_show}`"
+        else:
+            detail = f"匹配到插件 **{display}**"
+
+        # ── auto 模式：直接执行 ──
+        if self.llm_execute_mode == "auto":
+            if command_name and command_name != "-":
+                cmd_trigger = command_name.lstrip("/")
+                exec_cmd = f"{cmd_trigger} {args_str}".strip()
+
+                logger.info(f"LLM auto 执行: /{exec_cmd}")
+                success = execute_command(event, cmd_trigger, args_str, self.context)
+
+                if success:
+                    yield event.plain_result(f"✅ {detail}\n正在执行 `/{exec_cmd}`...")
+                else:
+                    yield event.plain_result(f"⚠️ {detail}\n执行失败，请手动发送：`/{exec_cmd}`")
+            elif pinfo:
+                yield event.plain_result(
+                    format_plugin(plugin_name, pinfo, self.max_commands_per_plugin, self.command_format)
+                )
+            else:
+                yield event.plain_result(f"⚠️ {detail}\n（插件缓存中未找到，请先 /扫描）")
+            return
+
+        # ── confirm 模式：先确认 ──
+        pending_key = event.get_sender_id() or event.get_session_id()
+        self._pending_llm[pending_key] = {
+            "plugin_name": plugin_name,
+            "command_name": command_name,
+            "args": args_str,
+            "timestamp": time.time(),
+        }
+
+        if command_name and command_name != "-":
+            cmd_show = command_name
+            if not cmd_show.startswith("/") and not cmd_show.startswith("正则:") and not cmd_show.startswith("["):
+                cmd_show = "/" + cmd_show
+            if args_str:
+                cmd_show += f" {args_str}"
+
+            yield event.plain_result(
+                f"{detail}\n"
+                f"确认要执行 `{cmd_show}` 吗？\n"
+                f"请回复 **确认** 或 **是** 来执行，回复其他内容取消。\n"
+                f"（60 秒后过期）"
+            )
+        elif pinfo:
+            yield event.plain_result(
+                format_plugin(plugin_name, pinfo, self.max_commands_per_plugin, self.command_format)
+            )
+        else:
+            yield event.plain_result(f"⚠️ {detail}\n（插件缓存中未找到，请先 /扫描）")
+
+    # ── LLM 确认监听器 ─────────────────────────────
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def llm_pending_listener(self, event: AstrMessageEvent):
+        """监听所有消息，处理 LLM 路由的确认/取消"""
+        if not self._pending_llm:
+            return
+
+        sender_id = event.get_sender_id() or event.get_session_id()
+        if not sender_id:
+            return
+
+        pending = self._pending_llm.get(sender_id)
+        if not pending:
+            return
+
+        # 60 秒过期
+        if time.time() - pending["timestamp"] > 60:
+            del self._pending_llm[sender_id]
+            return
+
+        resp = (event.get_message_str() if hasattr(event, "get_message_str") else "").strip().lower()
+        if resp not in ("确认", "是", "yes", "y", "ok", "好", "是的", "取消", "不", "no", "n", "算了"):
+            return
+
+        del self._pending_llm[sender_id]
+
+        if resp in ("确认", "是", "yes", "y", "ok", "好", "是的"):
+            plugin_name = pending["plugin_name"]
+            command_name = pending["command_name"]
+            args_str = pending.get("args", "")
+
+            if command_name and command_name != "-":
+                cmd_trigger = command_name.lstrip("/")
+                exec_cmd = f"{cmd_trigger} {args_str}".strip()
+
+                logger.info(f"LLM confirm 执行: /{exec_cmd}")
+                success = execute_command(event, cmd_trigger, args_str, self.context)
+
+                if success:
+                    yield event.plain_result(f"✅ 正在执行 `/{exec_cmd}`...")
+                else:
+                    yield event.plain_result(f"⚠️ 执行失败，请手动发送：`/{exec_cmd}`")
+            else:
+                pinfo = self.cache.commands.get(plugin_name)
+                if pinfo:
+                    yield event.plain_result(
+                        format_plugin(plugin_name, pinfo, self.max_commands_per_plugin, self.command_format)
+                    )
+                else:
+                    yield event.plain_result(f"[X] 插件 `{plugin_name}` 已不存在")
+        else:
+            yield event.plain_result("已取消。")
+
+        event.stop_event()
+
     # ── /命令 ──────────────────────────────────────
 
     @filter.command("命令")
@@ -182,10 +406,9 @@ class CommandDisplayer(Star):
                 "  /命令 delete all / 全部          - 删除全部记录\n"
                 "  /命令 delete [插件名]            - 删除指定插件记录\n"
                 "\n"
-                "格式参数：\n"
-                "  -s      简洁模式\n"
-                "  -d      详细模式（默认）\n"
-                "  -t      表格模式"
+                "格式参数：-s 简洁  -d 详细  -t 表格\n"
+                "\n"
+                "/LLM [自然语言]                    - AI 模糊匹配并执行命令"
             )
             return
 
@@ -201,37 +424,36 @@ class CommandDisplayer(Star):
                 positional.append(t)
 
         # 确定显示格式
+        fmt = self.command_format
         if "-s" in flags:
             fmt = "simple"
         elif "-t" in flags:
             fmt = "table"
         elif "-d" in flags:
             fmt = "detailed"
-        else:
-            fmt = self.command_format
 
         data = self.cache.commands
 
-        # 无位置参数 → 显示帮助
         if not positional:
             yield event.plain_result(
                 "/命令 用法：\n"
                 "  /命令 all / 全部 [-s|-d|-t]     - 查看所有插件命令\n"
                 "  /命令 [插件名] [-s|-d|-t]        - 查看指定插件命令\n"
                 "  /命令 delete all / 全部          - 删除全部记录\n"
-                "  /命令 delete [插件名]            - 删除指定插件记录"
+                "  /命令 delete [插件名]            - 删除指定插件记录\n"
+                "\n"
+                "/LLM [自然语言]                    - AI 模糊匹配并执行命令"
             )
             return
 
         action = positional[0].lower()
 
-        # ── 删除 ──
+        # 删除
         if action == "delete":
             target = positional[1] if len(positional) > 1 else ""
             if not target:
                 yield event.plain_result("[X] 请指定要删除的插件名或使用 all / 全部")
                 return
-
             if target.lower() in ("all", "全部"):
                 if not data:
                     yield event.plain_result("[X] 没有任何记录可删除")
@@ -242,16 +464,17 @@ class CommandDisplayer(Star):
                 yield event.plain_result(f"[-] 已删除全部 {count} 条插件记录")
                 return
 
-            matched = fuzzy_find(data, target, self.fuzzy_search_threshold)
+            provider = self.context.get_using_provider()
+            matched = await self._resolve_plugin(target, data, provider)
             if not matched:
-                yield event.plain_result(f"[X] 未找到插件 `{target}`")
+                yield event.plain_result(self._build_not_found_message(target, data))
                 return
             self.cache.remove_commands([matched])
             self.cache.save()
             yield event.plain_result(f"[-] 已删除插件 `{matched}` 的记录")
             return
 
-        # ── 查看全部 ──
+        # 查看全部
         if action in ("all", "全部"):
             if not data:
                 yield event.plain_result("[X] 未找到任何插件命令（请先使用 /扫描）")
@@ -259,15 +482,16 @@ class CommandDisplayer(Star):
             yield event.plain_result(format_all(data, self.max_commands_per_plugin, fmt))
             return
 
-        # ── 查看指定插件 ──
+        # 查看指定插件
         if not data:
-            yield event.plain_result("[X] 未找到任何插件命令（请先使用 /扫描）")
+            yield event.plain_result("[X) 未找到任何插件命令（请先使用 /扫描）")
             return
 
         plugin_name = positional[0]
-        matched = fuzzy_find(data, plugin_name, self.fuzzy_search_threshold)
+        provider = self.context.get_using_provider()
+        matched = await self._resolve_plugin(plugin_name, data, provider)
         if not matched:
-            yield event.plain_result(f"[X] 未找到插件 `{plugin_name}`")
+            yield event.plain_result(self._build_not_found_message(plugin_name, data))
             return
 
         yield event.plain_result(

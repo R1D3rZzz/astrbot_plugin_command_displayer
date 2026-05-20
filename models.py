@@ -1,46 +1,17 @@
-"""统一数据格式定义和常量"""
+"""数据模型、常量与工具函数"""
 
-from typing import Dict, TypedDict, List
+from typing import Dict, List, TypedDict
 
-# ═══════════════════════════════════════════════════════
-# 数据格式
-# ═══════════════════════════════════════════════════════
+# ── 数据来源常量 ──────────────────────────────────
 
-
-class CommandEntry(TypedDict, total=False):
-    """单条命令信息"""
-    command: str          # 命令名，如 "/天气"
-    args: str             # 参数说明，如 "[城市名]"，无则空串
-    description: str      # 命令功能说明
-    source: str           # 数据来源：SOURCE_DIRECT / SOURCE_LLM
-    filter_type: str      # 过滤器类型（仅直接读取时有值）
-    aliases: List[str]    # 别名列表（仅直接读取时有值）
-    is_regex: bool        # 是否正则匹配（仅直接读取时有值）
-
-
-class PluginInfo(TypedDict, total=False):
-    """插件信息"""
-    name: str             # 插件显示名
-    description: str      # 插件描述
-    commands: List[CommandEntry]  # 命令列表
-    source: str           # 数据来源：SOURCE_DIRECT / SOURCE_LLM
-
-
-# ═══════════════════════════════════════════════════════
-# 常量
-# ═══════════════════════════════════════════════════════
-
-# 数据来源
 SOURCE_DIRECT = "direct"
 SOURCE_LLM = "llm"
 
-# 数据来源标记
 SOURCE_TAGS: Dict[str, str] = {
     SOURCE_DIRECT: "[直接]",
     SOURCE_LLM: "[LLM]",
 }
 
-# 过滤器类型标记
 FILTER_TYPE_TAGS: Dict[str, str] = {
     "command": "[指令]",
     "regex": "[正则]",
@@ -50,20 +21,59 @@ FILTER_TYPE_TAGS: Dict[str, str] = {
     "CommandGroupFilter": "[指令组]",
 }
 
-# 日志级别映射
 LOG_LEVEL_MAP = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
 
-# 缓存文件路径
+# ── 文件路径 ──────────────────────────────────────
+
 CACHE_FILE_PATH = "data/command_displayer/cache.json"
+INDEX_FILE_PATH = "data/command_displayer/command_index.json"
+
+# ── 数据类型 ──────────────────────────────────────
 
 
-# ═══════════════════════════════════════════════════════
-# 工具函数
-# ═══════════════════════════════════════════════════════
+class CommandEntry(TypedDict, total=False):
+    """单条命令信息（内存缓存格式）"""
+    command: str
+    args: str
+    args_description: str
+    description: str
+    source: str
+    filter_type: str
+    aliases: List[str]
+    is_regex: bool
+
+
+class PluginInfo(TypedDict, total=False):
+    """插件信息（内存缓存格式）"""
+    name: str
+    description: str
+    commands: List[CommandEntry]
+    source: str
+
+
+class IndexCommand(TypedDict, total=False):
+    """命令索引条目（command_index.json 格式）"""
+    command: str
+    args: str
+    args_description: str
+    description: str
+    filter_type: str
+
+
+class IndexPlugin(TypedDict, total=False):
+    """插件索引条目（command_index.json 格式）"""
+    name: str
+    key: str
+    description: str
+    source: str
+    commands: List[IndexCommand]
+
+
+# ── 工具函数 ──────────────────────────────────────
 
 
 def name_matches(a: str, b: str) -> bool:
-    """名称匹配（忽略大小写和常见分隔符差异）"""
+    """名称匹配（忽略大小写和常见分隔符）"""
     norm = lambda s: s.lower().replace("_", "").replace("-", "").replace(" ", "")
     return norm(a) == norm(b)
 
