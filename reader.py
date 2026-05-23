@@ -1,6 +1,5 @@
 """从 star_handlers_registry 直接读取已注册插件的指令和行为"""
 
-import inspect
 import re
 from typing import Dict, List, Optional
 
