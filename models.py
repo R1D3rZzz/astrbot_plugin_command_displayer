@@ -23,6 +23,19 @@ FILTER_TYPE_TAGS: Dict[str, str] = {
 
 LOG_LEVEL_MAP = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
 
+# ── LLM 路由参数 ─────────────────────────────────
+
+LLM_TEMPERATURE = 0.1          # 路由 LLM 温度
+LLM_CONFIRM_TIMEOUT = 60       # 确认超时（秒）
+
+# ── 缓存与扫描参数 ────────────────────────────────
+
+DEFAULT_SCAN_INTERVAL = 300    # 后台扫描间隔（秒）
+DEFAULT_CACHE_TIMEOUT = 30     # 缓存超时（分钟）
+MAX_README_SIZE = 1024 * 1024  # README 最大 1MB
+MAX_INDEX_CHARS = 8000         # 路由索引最大字符数
+MAX_FULL_PROXY_CHARS = 16000   # 全权代理索引最大字符数
+
 # ── 文件路径 ──────────────────────────────────────
 
 CACHE_FILE_PATH = "data/command_displayer/cache.json"

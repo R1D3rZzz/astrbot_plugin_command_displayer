@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 from astrbot.api import logger
 
 from .models import (
-    CACHE_FILE_PATH, INDEX_FILE_PATH,
+    INDEX_FILE_PATH, MAX_README_SIZE,
     PluginInfo, IndexPlugin, IndexCommand,
     SOURCE_DIRECT, SOURCE_LLM,
     name_in_data, name_matches,
@@ -23,7 +23,7 @@ class PluginScanner:
     def __init__(
         self,
         plugins_directory: str,
-        max_readme_size: int = 1048576,
+        max_readme_size: int = MAX_README_SIZE,
         include_disabled: bool = False,
         enable_llm_analysis: bool = True,
     ):
@@ -67,8 +67,10 @@ class PluginScanner:
         """
         全量扫描：
         1. 直接读取已注册指令
-        2. 对未覆盖的插件尝试 LLM 解析 README
-        3. 合并结果并构建命令索引
+        2. 若启用了 LLM 分析，对所有有 README 的插件进行 LLM 解析，
+           将 LLM 提取的描述信息合并到直接读取的数据中（补充命令描述、参数说明、插件描述）
+        3. 对直接读取也未覆盖的插件，LLM 解析作为兜底完整数据
+        4. 合并结果并构建命令索引
         """
         dirs = self.get_plugin_dirs()
         cache.commands = {}
@@ -78,26 +80,17 @@ class PluginScanner:
         direct_data = read_registered_commands(context)
         logger.info(f"直接读取到 {len(direct_data)} 个已注册插件")
 
-        # LLM 兜底
-        llm_data: Dict[str, PluginInfo] = {}
-        uncovered = [d for d in dirs if not name_in_data(d.name, direct_data)]
-        if self._enable_llm_analysis and uncovered:
-            logger.info(f"对 {len(uncovered)} 个未注册插件尝试 LLM 解析...")
-            for plugin_dir in uncovered:
-                info = await self._read_and_parse(plugin_dir, provider)
-                if info:
-                    llm_data[info["name"]] = info
+        all_data: Dict[str, PluginInfo] = dict(direct_data)
+        await self._merge_llm_data(dirs, direct_data, all_data, provider)
 
-        # 合并 + 构建索引
-        all_data = {**direct_data, **llm_data}
         cache.commands = all_data
         cache.index = self._build_index(all_data)
         cache.timestamp = int(time.time())
         cache.save()
 
         logger.info(
-            f"全量扫描完成: 直接 {len(direct_data)} + LLM {len(llm_data)} = "
-            f"{len(all_data)} 个插件, {sum(len(p.get('commands', [])) for p in all_data.values())} 条命令"
+            f"全量扫描完成: 直接 {len(direct_data)} 个插件, "
+            f"共 {len(all_data)} 个插件, {sum(len(p.get('commands', [])) for p in all_data.values())} 条命令"
         )
         return all_data
 
@@ -113,18 +106,11 @@ class PluginScanner:
             logger.info(f"移除已删除插件: {removed}")
 
         direct_data = read_registered_commands(context)
-
         new_dirs, _ = self.get_delta(cache)
-        llm_data: Dict[str, PluginInfo] = {}
-        if self._enable_llm_analysis and new_dirs:
-            for plugin_dir in new_dirs:
-                if name_in_data(plugin_dir.name, direct_data):
-                    continue
-                info = await self._read_and_parse(plugin_dir, provider)
-                if info:
-                    llm_data[info["name"]] = info
+        new_data: Dict[str, PluginInfo] = dict(direct_data)
 
-        new_data = {**direct_data, **llm_data}
+        await self._merge_llm_data(new_dirs, direct_data, new_data, provider)
+
         if new_data:
             cache.update_commands(new_data)
 
@@ -134,6 +120,42 @@ class PluginScanner:
         cache.timestamp = int(time.time())
         cache.save()
         return new_data
+
+    # ── LLM 合并（scan_all / scan_new 共用）──────────
+
+    async def _merge_llm_data(
+        self, dirs: List[Path], direct_data: Dict[str, PluginInfo],
+        target: Dict[str, PluginInfo], provider
+    ):
+        """将 LLM 解析的描述合并到 target 中，或作为未覆盖插件的兜底"""
+        if self._enable_llm_analysis and provider:
+            logger.info("LLM 分析已启用，开始解析插件 README 以补充描述...")
+            for plugin_dir in dirs:
+                llm_info = await self._read_and_parse(plugin_dir, provider)
+                if not llm_info:
+                    continue
+
+                # 查找对应的直接读取数据
+                direct_key = None
+                for dk in direct_data:
+                    if dk == plugin_dir.name or name_matches(dk, plugin_dir.name):
+                        direct_key = dk
+                        break
+
+                if direct_key is not None:
+                    merged = self._merge_llm_into_direct(direct_data[direct_key], llm_info, plugin_dir.name)
+                    target[direct_key] = merged
+                else:
+                    target[llm_info["name"]] = llm_info
+        else:
+            # 未启用 LLM：对未覆盖的插件仍尝试 LLM 兜底
+            uncovered = [d for d in dirs if not name_in_data(d.name, target)]
+            if uncovered:
+                logger.info(f"对 {len(uncovered)} 个未注册插件尝试 LLM 解析...")
+                for plugin_dir in uncovered:
+                    info = await self._read_and_parse(plugin_dir, provider)
+                    if info:
+                        target[info["name"]] = info
 
     # ── 单插件扫描 ────────────────────────────────────
 
@@ -213,6 +235,67 @@ class PluginScanner:
 
     # ── 内部方法 ──────────────────────────────────────
 
+    @staticmethod
+    def _merge_llm_into_direct(
+        direct: PluginInfo, llm: PluginInfo, dir_name: str
+    ) -> PluginInfo:
+        """
+        将 LLM 解析的描述信息合并到直接读取的插件数据中。
+
+        合并策略：
+        - 插件描述：优先使用直接读取的（通常更准确），若为空则用 LLM 的
+        - 命令列表：以直接读取的命令结构为基础（命令名、参数格式来自 handler_params），
+          用 LLM 解析的描述信息补充每条命令的 description 和 args_description
+        - 如果 LLM 发现了直接读取中缺失的命令（README 中有但 handler 未注册的），
+          也追加进来（标记 source=llm）
+        - source 标记为 "direct+llm" 表示已合并
+        """
+        merged: PluginInfo = {
+            "name": direct.get("name") or llm.get("name") or dir_name,
+            "description": direct.get("description") or llm.get("description", ""),
+            "commands": [],
+            "source": "direct+llm",
+        }
+
+        # 建立 LLM 命令的查找表（按命令名归一化）
+        llm_cmd_map: Dict[str, dict] = {}
+        for llm_cmd in llm.get("commands", []):
+            key = llm_cmd.get("command", "").lower().lstrip("/")
+            if key:
+                llm_cmd_map[key] = llm_cmd
+
+        # 处理直接读取的命令：用 LLM 描述补充
+        direct_cmd_keys: set = set()
+        for d_cmd in direct.get("commands", []):
+            cmd_name = d_cmd.get("command", "")
+            cmd_key = cmd_name.lower().lstrip("/")
+            direct_cmd_keys.add(cmd_key)
+
+            # 查找 LLM 中对应的命令描述
+            llm_cmd = llm_cmd_map.get(cmd_key, {})
+
+            merged_cmd = dict(d_cmd)
+            # 补充命令描述：直接读取为空时用 LLM 的
+            if not merged_cmd.get("description", "").strip() or merged_cmd.get("description") == "无描述":
+                llm_desc = llm_cmd.get("description", "").strip()
+                if llm_desc and llm_desc != "无描述":
+                    merged_cmd["description"] = llm_desc
+            # 补充参数说明：直接读取为空时用 LLM 的
+            if not merged_cmd.get("args_description", "").strip():
+                llm_args_desc = llm_cmd.get("args_description", "").strip()
+                if llm_args_desc:
+                    merged_cmd["args_description"] = llm_args_desc
+
+            merged["commands"].append(merged_cmd)
+
+        # 追加 LLM 中发现但直接读取中缺失的命令
+        for llm_cmd in llm.get("commands", []):
+            key = llm_cmd.get("command", "").lower().lstrip("/")
+            if key and key not in direct_cmd_keys:
+                merged["commands"].append(dict(llm_cmd))
+
+        return merged
+
     def _find_plugin_dir(self, plugin_name: str) -> Optional[Path]:
         """根据名称查找插件目录"""
         # 精确匹配
@@ -257,7 +340,7 @@ def _self_plugin_index() -> IndexPlugin:
     """
     return IndexPlugin(
         name="Command Displayer",
-        description="AstrBot 插件命令中枢，用于查询、扫描、路由和执行所有插件命令",
+        description="AstrBot 插件命令中枢，统一管理和查询所有插件命令",
         source=SOURCE_DIRECT,
         commands=[
             # /LLM [自然语言]
@@ -265,7 +348,7 @@ def _self_plugin_index() -> IndexPlugin:
                 command="/LLM",
                 args="[query]",
                 args_description="query: 自然语言描述，如：帮我查北京天气、查看所有命令",
-                description="用自然语言描述意图，AI 从命令索引中匹配最相关的具体命令并执行",
+                description="用自然语言描述意图，AI 匹配最相关的具体命令并执行",
                 filter_type="command",
             ),
             # /命令 [subcmd] [arg]  (main.py: command_handler(self, event, subcmd="", arg=""))
@@ -273,16 +356,13 @@ def _self_plugin_index() -> IndexPlugin:
                 command="/命令",
                 args="[subcmd] [-s|-d|-t]",
                 args_description=(
-                    "subcmd: 子命令，可选值：all/全部/delete/插件名；"
-                    "-s: 简洁模式，只显示命令名和别名；"
-                    "-d: 详细模式（默认），显示命令名、别名和描述；"
-                    "-t: 表格模式，以表格形式输出"
+                    "subcmd: all/全部 查看所有插件命令；插件名 查看指定插件命令；"
+                    "delete 插件名/all 删除记录；"
+                    "-s: 简洁模式（只显示命令名）；"
+                    "-d: 详细模式（显示命令名和描述，默认）；"
+                    "-t: 表格模式"
                 ),
-                description=(
-                    "查看指定插件的所有命令，或删除缓存记录。"
-                    "支持格式参数 -s/-d/-t 控制输出样式。"
-                    "子命令 delete 可删除指定插件或全部记录"
-                ),
+                description="查看插件的命令列表及其描述，支持按插件名筛选、按格式输出，也可删除缓存记录",
                 filter_type="command",
             ),
             # /扫描 [subcmd]  (main.py: scan_handler(self, event, subcmd=""))
@@ -290,13 +370,9 @@ def _self_plugin_index() -> IndexPlugin:
                 command="/扫描",
                 args="[subcmd]",
                 args_description=(
-                    "subcmd: 子命令，可选值：all/全部（全量扫描）、add/增量（增量扫描）、插件名（单插件扫描）"
+                    "subcmd: all/全部 全量扫描；add/增量 增量扫描；插件名 扫描单个插件"
                 ),
-                description=(
-                    "扫描插件目录，刷新命令缓存和命令索引。"
-                    "全量扫描会重新读取所有已注册指令并解析未注册插件的 README；"
-                    "增量扫描只处理新增插件"
-                ),
+                description="扫描插件目录，刷新命令缓存和索引（首次使用前需先执行全量扫描）",
                 filter_type="command",
             ),
             # /全部插件  (无参数)
@@ -304,7 +380,7 @@ def _self_plugin_index() -> IndexPlugin:
                 command="/全部插件",
                 args="",
                 args_description="无参数",
-                description="列出所有已加载插件的名称、数据来源（直接读取/LLM解析）和命令数量",
+                description="列出所有已安装插件的名称和数量概览，不含各插件的命令详情",
                 filter_type="command",
             ),
             # /帮助  (无参数)
@@ -312,7 +388,7 @@ def _self_plugin_index() -> IndexPlugin:
                 command="/帮助",
                 args="",
                 args_description="无参数",
-                description="显示本插件的命令帮助信息，包含所有命令的用法和示例",
+                description="显示本插件(Command Displayer)的命令帮助，仅含本插件用法，不含其他插件",
                 filter_type="command",
             ),
         ],

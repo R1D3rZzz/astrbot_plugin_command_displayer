@@ -11,14 +11,16 @@
 """
 
 import copy
-import json
-from pathlib import Path
+import re
 from typing import Dict, List, Optional, Tuple
 
 from astrbot.api import logger
 from astrbot.core.message.components import Plain
 
-from .models import INDEX_FILE_PATH, IndexPlugin
+from .matcher import _find_command, _find_plugin, _match_command, _match_plugin
+from .models import MAX_FULL_PROXY_CHARS, MAX_INDEX_CHARS, LLM_TEMPERATURE, IndexPlugin
+from .parser import _extract_response_text
+from .prompts import _FULL_PROXY_PROMPT, _REVIEW_PROMPT, _ROUTE_PROMPT, _TOPN_REFINE_PROMPT
 
 
 # ── 数据结构 ──────────────────────────────────────
@@ -26,39 +28,22 @@ from .models import INDEX_FILE_PATH, IndexPlugin
 # LLM 路由结果: (plugin_name, command_name, args_str, confirmation_message)
 RouteResult = Tuple[str, str, str, str]
 
-# 命令索引最大字符数（防止超出 LLM 上下文窗口）
-MAX_INDEX_CHARS = 8000
 
-
-# ── 命令索引加载 ──────────────────────────────────
-
-
-def load_command_index() -> List[IndexPlugin]:
-    """从 command_index.json 加载命令索引"""
-    path = Path(INDEX_FILE_PATH)
-    if not path.exists():
-        logger.warning("command_index.json 不存在，请先执行 /扫描 all")
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data.get("plugins", [])
-    except Exception as e:
-        logger.error(f"加载命令索引失败: {e}")
-        return []
+# ── 命令索引文本构建 ────────────────────────────────
 
 
 def build_index_text(plugins: List[IndexPlugin], max_chars: int = MAX_INDEX_CHARS) -> str:
     """
     将命令索引构建为 LLM 可读的文本格式。
-    每条命令包含：命令名、参数、参数说明、命令描述、过滤器类型。
-    使用缩进和标记让 LLM 更容易解析。
+    每条命令包含：命令名、参数、参数说明、命令描述、使用示例。
+    格式设计使 LLM 能准确区分相似命令并理解参数含义。
     """
     lines: List[str] = []
 
     for plugin in plugins:
         pname = plugin.get("name", "")
         pdesc = plugin.get("description", "")
-        header = f"## { pname}"
+        header = f"## {pname}"
         if pdesc:
             header += f"\n   描述: {pdesc}"
 
@@ -75,16 +60,22 @@ def build_index_text(plugins: List[IndexPlugin], max_chars: int = MAX_INDEX_CHAR
             if args:
                 line += f" {args}"
 
-            # 描述行（缩进对齐）
-            detail_parts = []
+            # 功能描述（独立一行，最醒目）
             if cmd_desc and cmd_desc != "无描述":
-                detail_parts.append(f"功能: {cmd_desc}")
+                line += f"\n       功能: {cmd_desc}"
+
+            # 参数说明（独立一行）
             if args_desc:
-                detail_parts.append(f"参数: {args_desc}")
+                line += f"\n       参数说明: {args_desc}"
+
+            # 过滤器类型（非标准 command 类型时标注）
             if ftype and ftype not in ("command",):
-                detail_parts.append(f"类型: {ftype}")
-            if detail_parts:
-                line += f"\n       {'; '.join(detail_parts)}"
+                line += f"\n       类型: {ftype}"
+
+            # 使用示例（根据参数自动生成）
+            example = _generate_example(name, args, args_desc)
+            if example:
+                line += f"\n       示例: {example}"
 
             cmd_lines.append(line)
 
@@ -100,79 +91,67 @@ def build_index_text(plugins: List[IndexPlugin], max_chars: int = MAX_INDEX_CHAR
     return "\n".join(lines)
 
 
-# ── LLM 命令级路由 ──────────────────────────────────
+def _generate_example(command: str, args: str, args_desc: str) -> str:
+    """根据命令名和参数自动生成使用示例"""
+    if not args:
+        return f"{command}"
 
-_ROUTE_PROMPT = (
-    "你是一个 AstrBot 指令路由助手。用户输入了一段自然语言，你需要从下面的命令索引中"
-    "找出最匹配的一条具体命令。\n"
-    "\n"
-    "【匹配策略】\n"
-    "1. 首先理解用户意图：是想执行某个操作，还是查询某个插件/命令的信息？\n"
-    "2. 优先匹配「功能描述」与用户意图最吻合的命令\n"
-    "3. 如果多个命令都匹配，选择最具体的那条（而非笼统的 help/list 类命令）\n"
-    "4. 如果用户只是想看某插件的所有命令列表，命令名填 \"-\"\n"
-    "5. 如果用户想看全部命令，返回 LIST_ALL\n"
-    "6. 完全无法匹配时返回 NONE\n"
-    "\n"
-    "【参数提取规则】\n"
-    "- 从用户输入中提取命令所需的参数值（如城市名、日期、关键词等）\n"
-    "- 只提取命令索引中「参数」列声明的参数\n"
-    "- 如果用户没有提供足够参数，提取已有的部分，缺少的留空\n"
-    "- 无参数的命令，参数栏填 \"-\"\n"
-    "\n"
-    "【返回格式】\n"
-    "严格返回一行，用 | 分隔，共 4 段：\n"
-    "  插件名 | 命令名 | 参数 | 简短确认语\n"
-    "\n"
-    "插件名：命令索引中 ## 后面的名称（如 天气查询、Command Displayer）\n"
-    "命令名：如 /天气、/扫描、正则:xxx 等，不带引号\n"
-    "参数：从用户输入中提取的参数值，多个参数用空格分隔，没有则填 \"-\"\n"
-    "简短确认语：一句话告诉用户匹配到了什么，20 字以内\n"
-    "\n"
-    "【返回示例】\n"
-    "用户: 帮我查北京天气\n"
-    "返回: 天气查询 | /天气 | 北京 | 将查询北京的天气\n"
-    "\n"
-    "用户: 扫描所有插件\n"
-    "返回: Command Displayer | /扫描 | all | 将执行全量扫描\n"
-    "\n"
-    "用户: 查看天气插件有哪些命令\n"
-    "返回: 天气查询 | - | - | 将展示天气查询插件的所有命令\n"
-    "\n"
-    "用户: 列出所有命令\n"
-    "返回: LIST_ALL | - | - | 将为你展示所有命令\n"
-    "\n"
-    "用户: 今天吃什么好\n"
-    "返回: NONE | - | - | -\n"
-    "\n"
-    "【注意】\n"
-    "- 只返回一行，不要返回任何其他内容（不要解释、不要 markdown）\n"
-    "- 插件名和命令名必须与索引中完全一致\n"
-    "- 如果用户意图是「查看/列出/显示」某插件的命令，命令名填 \"-\"\n"
-    "\n"
-    "【命令索引】\n{index}\n"
-    "\n"
-    "【用户输入】\n{query}\n"
-    "\n"
-    "请返回："
-)
+    # 解析参数，生成示例值
+    example_args = []
+    param_names = re.findall(r'\[([^\]]+)\]', args)
+    flags = re.findall(r'(-\w)', args)
+
+    for pname in param_names:
+        pname_lower = pname.lower()
+        if any(k in pname_lower for k in ("城市", "地点", "city")):
+            example_args.append("北京")
+        elif any(k in pname_lower for k in ("日期", "时间", "date", "time")):
+            example_args.append("今天")
+        elif any(k in pname_lower for k in ("插件", "plugin", "名称", "name")):
+            example_args.append("天气查询")
+        elif any(k in pname_lower for k in ("天数", "数量", "count", "num")):
+            example_args.append("3")
+        elif any(k in pname_lower for k in ("关键词", "keyword", "搜索", "search", "query")):
+            example_args.append("你好")
+        elif any(k in pname_lower for k in ("用户", "user", "uid", "id")):
+            example_args.append("123456")
+        elif any(k in pname_lower for k in ("子命令", "subcmd", "sub")):
+            example_args.append("all")
+        else:
+            example_args.append(f"<{pname}>")
+
+    if example_args:
+        return f"{command} {' '.join(example_args)}"
+    elif flags:
+        return f"{command} {flags[0]}"
+    else:
+        return f"{command}"
+
+
+# ── LLM 命令级路由 ──────────────────────────────────
 
 
 async def llm_resolve(
     query: str,
     data: Dict[str, dict],
     provider,
+    enable_review: bool = True,
+    exclude: Optional[List[str]] = None,
 ) -> Optional[RouteResult]:
     """
-    使用 LLM 将自然语言路由到具体命令。
+    使用 LLM 将自然语言路由到具体命令（三步 TOP-N 流程）。
 
+    第一步：从全部命令索引中粗筛 TOP-3 候选
+    第二步：将候选详情 + 用户原始意图发给 LLM，让 LLM 精选并提取参数
+    第三步：自校对 — 验证选中的命令是否匹配用户意图，不匹配则重新选择
+
+    exclude: 要排除的命令列表，格式 ['插件名|命令名', ...]（用户之前拒绝过的）
     返回 (plugin_name, command_name, args_str, confirmation_message) 或 None。
     plugin_name == "__list_all__" 表示用户想看全部。
     """
     if not data or not provider:
         return None
 
-    # 从缓存数据构建索引文本
     plugins = _dict_to_index(data)
     index_text = build_index_text(plugins)
     if not index_text:
@@ -180,12 +159,84 @@ async def llm_resolve(
 
     prompt = _ROUTE_PROMPT.format(index=index_text, query=query)
 
+    if exclude:
+        lines = []
+        for e in exclude:
+            parts = e.split("|", 1)
+            lines.append(f"  - {parts[0]} / {parts[1]}" if len(parts) > 1 else f"  - {parts[0]}")
+        prompt += "\n\n【以下命令已被用户拒绝，请不要选择：】\n" + "\n".join(lines)
+
     try:
-        resp = await provider.text_chat(prompt, temperature=0.1)
+        # ── 第一步：粗筛 TOP-N 候选 ──
+        resp = await provider.text_chat(prompt, temperature=LLM_TEMPERATURE)
         raw = _extract_response_text(resp)
         if not raw:
             return None
-        return _parse_route_result(raw, plugins)
+
+        # 处理特殊指令
+        if raw.upper().startswith("LIST_ALL"):
+            return ("__list_all__", "-", "-", "将为你展示所有命令")
+        if raw.upper().startswith("NONE"):
+            return None
+
+        # 解析所有候选
+        candidates = _parse_topn_candidates(raw, plugins)
+        if not candidates:
+            fallback = _parse_single_route_line(raw.strip(), plugins)  # 兜底：按单行解析
+            if fallback and exclude and _is_excluded(fallback, exclude):
+                return None
+            return fallback
+
+        # 过滤已排除的候选
+        if exclude:
+            candidates = [c for c in candidates if not _is_excluded(c, exclude)]
+            if not candidates:
+                return None
+
+        # ── 第二步：精选 + 参数提取 ──
+        candidate_text = _format_candidates(candidates, plugins)
+        refine_prompt = _TOPN_REFINE_PROMPT.format(
+            candidates=candidate_text, query=query
+        )
+
+        resp2 = await provider.text_chat(refine_prompt, temperature=LLM_TEMPERATURE)
+        raw2 = _extract_response_text(resp2)
+        if not raw2:
+            logger.debug("TOP-N 第二步未返回结果，使用第一步首个候选")
+            return candidates[0]
+
+        refined = _parse_single_route_line(raw2.strip(), plugins)
+        if not refined or (exclude and _is_excluded(refined, exclude)):
+            logger.debug("TOP-N 第二步解析失败或被排除，使用第一步首个候选")
+            for c in candidates:
+                if not exclude or not _is_excluded(c, exclude):
+                    return c
+            return None
+
+        # ── 第三步：自校对 ──
+        if enable_review:
+            sel_text = _format_selection_for_review(refined, plugins)
+            review_prompt = _REVIEW_PROMPT.format(
+                query=query, selection=sel_text, candidates=candidate_text
+            )
+
+            resp3 = await provider.text_chat(review_prompt, temperature=LLM_TEMPERATURE)
+            raw3 = _extract_response_text(resp3)
+            if raw3:
+                review_result = raw3.strip()
+                if review_result.upper().startswith("CORRECT"):
+                    logger.debug(f"LLM 自校对通过: {refined[0]}/{refined[1]}")
+                    return _check_and_fix_mismatch(refined, query, candidates, plugins)
+                # 校对不通过，解析新选择
+                new_result = _parse_single_route_line(review_result, plugins)
+                if new_result:
+                    logger.info(f"LLM 自校对修正: {refined[0]}/{refined[1]} → {new_result[0]}/{new_result[1]}")
+                    return _check_and_fix_mismatch(new_result, query, candidates, plugins)
+
+            # 校对无明确结论，沿用第二步结果
+            logger.debug(f"LLM 自校对无结论，沿用第二步结果: {refined[0]}/{refined[1]}")
+
+        return _check_and_fix_mismatch(refined, query, candidates, plugins)
 
     except Exception:
         logger.exception("LLM 路由异常")
@@ -217,36 +268,172 @@ def _dict_to_index(data: Dict[str, dict]) -> List[IndexPlugin]:
     return result
 
 
-def _extract_response_text(resp) -> Optional[str]:
-    """从 LLMResponse 对象中提取文本内容"""
-    if not resp:
-        return None
-    if hasattr(resp, "result_chain") and resp.result_chain:
-        chain = getattr(resp.result_chain, "chain", None)
-        if chain:
-            text = "".join(getattr(c, "text", "") for c in chain)
-            if text.strip():
-                return text.strip()
-    for attr in ("result", "content"):
-        if hasattr(resp, attr):
-            text = str(getattr(resp, attr)).strip()
-            if text:
-                return text
-    text = str(resp).strip()
-    return text if text else None
+def _parse_topn_candidates(raw: str, plugins: List[IndexPlugin]) -> List[RouteResult]:
+    """解析 TOP-N 候选行，返回所有有效候选列表"""
+    raw = raw.strip()
+    if raw.upper().startswith("NONE") or raw.upper().startswith("LIST_ALL"):
+        return []
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    candidates: List[RouteResult] = []
+    for line in lines:
+        parsed = _parse_single_route_line(line, plugins)
+        if parsed:
+            candidates.append(parsed)
+    return candidates
 
 
-def _parse_route_result(
+def _format_candidates(candidates: List[RouteResult], plugins: List[IndexPlugin]) -> str:
+    """将候选列表格式化为带详细信息的文本，供 LLM 精选"""
+    details: List[str] = []
+    for i, (pk, cn, _, _) in enumerate(candidates, 1):
+        pinfo = _find_plugin(pk, plugins)
+        pdesc = pinfo.get("description", "") if pinfo else ""
+
+        cmd_info = _find_command(cn, pinfo) if pinfo and cn else None
+
+        # 构建展示
+        display = pinfo.get("name", pk) if pinfo else pk
+        cmd_str = cn if cn else "-"
+        if cmd_info:
+            args = cmd_info.get("args", "").strip()
+            if args:
+                cmd_str += f" {args}"
+            detail_parts = _cmd_detail_lines(cmd_info)
+            if detail_parts:
+                cmd_str += f"\n     {'; '.join(detail_parts)}"
+
+        line = f"{i}. {display} | {cmd_str}"
+        if pdesc:
+            line += f"\n   插件描述: {pdesc}"
+        details.append(line)
+    return "\n".join(details)
+
+
+def _format_selection_for_review(
+    selection: RouteResult, plugins: List[IndexPlugin]
+) -> str:
+    """将选中的命令格式化为详细信息，供自校对步骤使用"""
+    pk, cn, args, msg = selection
+
+    pinfo = _find_plugin(pk, plugins)
+    display = pinfo.get("name", pk) if pinfo else pk
+    lines = [f"插件: {display}"]
+
+    cmd_info = _find_command(cn, pinfo) if pinfo and cn else None
+
+    cmd_str = cn if cn else "-"
+    if args:
+        cmd_str += f" {args}"
+    lines.append(f"命令: {cmd_str}")
+
+    if cmd_info:
+        lines.extend(_cmd_detail_lines(cmd_info))
+
+    lines.append(f"确认语: {msg}")
+    return "\n".join(lines)
+
+
+def _check_and_fix_mismatch(
+    result: RouteResult,
+    query: str,
+    candidates: List[RouteResult],
+    plugins: List[IndexPlugin],
+) -> RouteResult:
+    """
+    确定性兜底校验：自动从命令描述中提取否定短语（如"不含xx"、"不能查看xx"），
+    与用户意图做匹配，发现冲突时从候选中找替代命令。
+    """
+    pk, cn, args, msg = result
+
+    # 找到选中命令的功能描述
+    pinfo = _find_plugin(pk, plugins)
+    if not pinfo:
+        return result
+    cmd_info = _find_command(cn, pinfo)
+    if not cmd_info:
+        return result
+    desc = cmd_info.get("description", "")
+
+    if not desc:
+        return result
+
+    # 从描述中提取否定短语后的关键词
+    # 如 "不含命令详情" → "命令详情"，"不能查看指令" → "查看指令"
+    negation_markers = ("不含", "不包含", "不能查看", "不能显示", "不支持", "无法")
+    conflict_phrases = set()
+    for marker in negation_markers:
+        idx = desc.find(marker)
+        while idx != -1:
+            phrase = desc[idx + len(marker):].strip()
+            # 取到下一个标点或句尾
+            for sep in ("，", "。", "；", "、", "\n"):
+                if sep in phrase:
+                    phrase = phrase[:phrase.index(sep)]
+            if phrase:
+                conflict_phrases.add(phrase)
+            idx = desc.find(marker, idx + 1)
+
+    if not conflict_phrases:
+        return result
+
+    # 检查用户意图是否触及了这些否定内容
+    conflict = any(phrase in query for phrase in conflict_phrases)
+
+    if not conflict:
+        return result
+
+    # 发现冲突，从候选中找替代
+    for alt_pk, alt_cn, alt_args, alt_msg in candidates:
+        if alt_cn == cn and alt_pk == pk:
+            continue
+        alt_pinfo = _find_plugin(alt_pk, plugins)
+        if not alt_pinfo:
+            continue
+        alt_cmd = _find_command(alt_cn, alt_pinfo)
+        alt_desc = alt_cmd.get("description", "") if alt_cmd else ""
+        # 替代命令的描述不包含同样的否定短语 → 可用
+        if not any(phrase in alt_desc for phrase in conflict_phrases):
+            logger.info(
+                f"确定性兜底修正: {pk}/{cn} → {alt_pk}/{alt_cn} "
+                f"(冲突短语: {conflict_phrases})"
+            )
+            return (alt_pk, alt_cn, alt_args, alt_msg)
+
+    return result
+
+
+
+def _is_excluded(result: RouteResult, exclude: List[str]) -> bool:
+    """检查路由结果是否在排除列表中"""
+    pk, cn, _, _ = result
+    return f"{pk}|{cn}" in exclude
+
+
+def _resolve_plugin_display(plugin_part: str, plugins: List[IndexPlugin]) -> Tuple[str, str]:
+    """将 LLM 返回的插件名解析为 (found_key, display_name)。"""
+    cache_key = _match_plugin(plugin_part, plugins)
+    pinfo = _find_plugin(cache_key or plugin_part, plugins)
+    if pinfo:
+        return pinfo.get("key", "") or pinfo.get("name", ""), pinfo.get("name", plugin_part)
+    return cache_key or plugin_part, plugin_part
+
+
+def _cmd_detail_lines(cmd_info: dict) -> List[str]:
+    """从命令信息中提取功能描述和参数说明，返回格式化行列表。"""
+    parts = []
+    desc = cmd_info.get("description", "").strip()
+    if desc and desc != "无描述":
+        parts.append(f"功能: {desc}")
+    adesc = cmd_info.get("args_description", "").strip()
+    if adesc:
+        parts.append(f"参数说明: {adesc}")
+    return parts
+
+
+def _parse_single_route_line(
     raw: str, plugins: List[IndexPlugin]
 ) -> Optional[RouteResult]:
-    """解析 LLM 返回的路由结果行"""
-    raw = raw.strip()
-
-    if raw.upper().startswith("NONE"):
-        return None
-    if raw.upper().startswith("LIST_ALL"):
-        return ("__list_all__", "-", "-", "将为你展示所有命令")
-
+    """解析单行路由结果"""
     # 解析: plugin_name | command_name | args | message
     parts = [p.strip() for p in raw.split("|")]
     if len(parts) < 4:
@@ -255,27 +442,15 @@ def _parse_route_result(
         # 只有插件名
         cache_key = _match_plugin(parts[0], plugins)
         if cache_key:
-            # 查找显示名
-            display = cache_key
-            for p in plugins:
-                if p.get("key", "") == cache_key or p.get("name", "") == cache_key:
-                    display = p.get("name", cache_key)
-                    break
+            pinfo = _find_plugin(cache_key, plugins)
+            display = pinfo.get("name", cache_key) if pinfo else cache_key
             return (cache_key, "-", "", f"找到插件 **{display}**，将展示其所有命令")
         return None
 
     plugin_part, cmd_part, args_part, msg_part = parts[0], parts[1], parts[2], parts[3]
 
     cache_key = _match_plugin(plugin_part, plugins)
-
-    # 查找插件显示名（优先用 name 匹配，也接受 key 匹配）
-    display = plugin_part
-    found_key = cache_key or plugin_part
-    for p in plugins:
-        if p.get("name") == plugin_part or p.get("key", "") == cache_key or p.get("name", "") == cache_key:
-            display = p.get("name", plugin_part)
-            found_key = p.get("key", "") or p.get("name", "")
-            break
+    found_key, display = _resolve_plugin_display(plugin_part, plugins)
 
     if not cache_key:
         # 降级：用 LLM 返回的原始名称
@@ -298,101 +473,95 @@ def _parse_route_result(
     return (found_key, "-", "", msg_part or f"找到插件 **{display}**")
 
 
-def _normalize(s: str) -> str:
-    """归一化名称用于模糊比较：去空格、去常见分隔符、转小写"""
-    return s.lower().replace(" ", "").replace("_", "").replace("-", "").replace("（", "(").replace("）", ")")
+# ── LLM 全权代理 ──────────────────────────────────
 
 
-def _match_plugin(guess: str, plugins: List[IndexPlugin]) -> Optional[str]:
+async def llm_resolve_all(
+    query: str,
+    data: Dict[str, dict],
+    provider,
+) -> Optional[Tuple[str, str, str, str, str]]:
     """
-    将 LLM 返回的插件名匹配到实际插件，返回缓存 key（p["key"] 或 p["name"]）。
-    支持多种模糊策略，按精确度从高到低依次尝试。
+    LLM 全权代理：将全部命令缓存发送给 LLM，让 LLM 自己解析并选择执行。
+
+    返回 (action, plugin_name, command_name, args_str, message) 或 None。
+    action 为 EXEC / SHOW / LIST_ALL / NONE。
     """
-    if not guess:
+    if not data or not provider:
         return None
-    guess = guess.strip()
 
-    def _get_key(p: IndexPlugin) -> str:
-        return p.get("key", "") or p.get("name", "")
+    # 构建完整的命令缓存文本（包含所有信息）
+    plugins = _dict_to_index(data)
+    cache_text = build_index_text(plugins, max_chars=MAX_FULL_PROXY_CHARS)
+    if not cache_text:
+        return None
 
-    # 策略 1：精确匹配 name（忽略大小写）
-    for p in plugins:
-        pname = p.get("name", "")
-        if pname and (pname == guess or pname.lower() == guess.lower()):
-            return _get_key(p)
+    prompt = _FULL_PROXY_PROMPT.format(cache=cache_text, query=query)
 
-    # 策略 2：归一化匹配 name（忽略空格、分隔符、大小写）
-    norm_guess = _normalize(guess)
-    for p in plugins:
-        pname = p.get("name", "")
-        if pname and _normalize(pname) == norm_guess:
-            return _get_key(p)
-
-    # 策略 3：子串匹配 name
-    for p in plugins:
-        pname = p.get("name", "")
-        if not pname:
-            continue
-        pnorm = _normalize(pname)
-        if pnorm and (pnorm in norm_guess or norm_guess in pnorm):
-            return _get_key(p)
-
-    # 策略 4：编辑距离兜底（更宽松的阈值）
-    all_names = [(p.get("name", ""), _get_key(p)) for p in plugins if p.get("name")]
-    scored = sorted(
-        ((_edit_distance(norm_guess, _normalize(n)), n, k) for n, k in all_names),
-        key=lambda x: x[0],
-    )
-    for dist, _name, key in scored[:3]:
-        threshold = min(max(len(norm_guess), len(_normalize(_name))) * 2 // 5, 6)
-        if dist <= threshold:
-            return key
-
-    return None
-
-
-def _match_command(guess: str, plugin_key: str, plugins: List[IndexPlugin]) -> Optional[str]:
-    """验证命令是否存在于指定插件中（plugin_key 可以是 name 或 key）"""
-    for p in plugins:
-        if p.get("name") == plugin_key or p.get("key", "") == plugin_key:
-            for cmd in p.get("commands", []):
-                cmd_name = cmd.get("command", "")
-                if cmd_name.lower() == guess.lower():
-                    return cmd_name
-                if cmd_name.lstrip("/").lower() == guess.lstrip("/").lower():
-                    return cmd_name
+    try:
+        resp = await provider.text_chat(prompt, temperature=LLM_TEMPERATURE)
+        raw = _extract_response_text(resp)
+        if not raw:
             return None
-    return None
+        return _parse_full_proxy_result(raw, plugins)
+
+    except Exception:
+        logger.exception("LLM 全权代理路由异常")
+        return None
 
 
-# ── 命令输错提醒 ──────────────────────────────────
+def _parse_full_proxy_result(
+    raw: str, plugins: List[IndexPlugin]
+) -> Optional[Tuple[str, str, str, str, str]]:
+    """解析全权代理 LLM 返回的结果"""
+    raw = raw.strip()
 
+    if raw.upper().startswith("NONE"):
+        return ("NONE", "-", "-", "-", "抱歉，没有找到匹配的命令")
 
-def suggest_correction(query: str, candidates: List[str], top_n: int = 3) -> List[str]:
-    """基于编辑距离，返回最相似的候选名列表"""
-    if not candidates or not query:
-        return []
-    q = query.lower()
-    scored = sorted(
-        ((_edit_distance(q, c.lower()), c) for c in candidates),
-        key=lambda x: x[0],
-    )
-    return [c for _, c in scored[:top_n]]
+    if raw.upper().startswith("LIST_ALL"):
+        return ("LIST_ALL", "-", "-", "-", "将为你展示所有可用命令")
 
+    parts = [p.strip() for p in raw.split("|")]
+    if len(parts) < 5:
+        parts = [p.strip() for p in raw.split("\t")]
+    if len(parts) < 5:
+        return None
 
-def _edit_distance(s1: str, s2: str) -> int:
-    """编辑距离（Levenshtein），空间优化"""
-    if len(s1) < len(s2):
-        return _edit_distance(s2, s1)
-    if not s2:
-        return len(s1)
-    prev = list(range(len(s2) + 1))
-    for i, c1 in enumerate(s1):
-        curr = [i + 1]
-        for j, c2 in enumerate(s2):
-            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (c1 != c2)))
-        prev = curr
-    return prev[-1]
+    action, plugin_part, cmd_part, args_part, msg_part = parts[0], parts[1], parts[2], parts[3], parts[4]
+
+    action = action.upper()
+    if action not in ("EXEC", "SHOW", "LIST_ALL", "NONE"):
+        return None
+
+    if action == "LIST_ALL":
+        return ("LIST_ALL", "-", "-", "-", msg_part or "将为你展示所有可用命令")
+
+    if action == "NONE":
+        return ("NONE", "-", "-", "-", msg_part or "抱歉，没有找到匹配的命令")
+
+    # 匹配插件
+    found_key, display = _resolve_plugin_display(plugin_part, plugins)
+
+    cmd_name = cmd_part if cmd_part != "-" else ""
+    args_str = args_part if args_part != "-" else ""
+
+    if action == "EXEC" and cmd_name:
+        # 验证命令
+        matched = _match_command(cmd_name, found_key, plugins)
+        if matched:
+            return (action, found_key, matched, args_str,
+                    msg_part or f"将执行 **{display}** 的 `{matched}` 命令")
+        # 命令未匹配到，降级为 SHOW
+        return ("SHOW", found_key, "-", "",
+                f"找到插件 **{display}**，将展示其所有命令")
+
+    if action == "SHOW":
+        return ("SHOW", found_key, "-", "",
+                msg_part or f"将展示 **{display}** 的所有命令")
+
+    return (action, found_key, cmd_name, args_str,
+            msg_part or f"匹配到 **{display}**")
 
 
 # ── 命令自动执行 ──────────────────────────────────
