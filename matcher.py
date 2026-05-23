@@ -14,7 +14,7 @@ def _normalize(s: str) -> str:
 _MIN_SUBSTRING_LEN = 2
 
 
-def _match_plugin(guess: str, plugins: List[IndexPlugin]) -> Optional[str]:
+def match_plugin(guess: str, plugins: List[IndexPlugin]) -> Optional[str]:
     """
     将 LLM 返回的插件名匹配到实际插件，返回缓存 key（p["key"] 或 p["name"]）。
     支持多种模糊策略，按精确度从高到低依次尝试。
@@ -56,7 +56,7 @@ def _match_plugin(guess: str, plugins: List[IndexPlugin]) -> Optional[str]:
     return None
 
 
-def _match_command(guess: str, plugin_key: str, plugins: List[IndexPlugin]) -> Optional[str]:
+def match_command(guess: str, plugin_key: str, plugins: List[IndexPlugin]) -> Optional[str]:
     """验证命令是否存在于指定插件中（plugin_key 可以是 name 或 key）。
     支持归一化匹配：忽略 / 前缀、大小写、空格差异。
     """
@@ -75,7 +75,7 @@ def _match_command(guess: str, plugin_key: str, plugins: List[IndexPlugin]) -> O
     return None
 
 
-def _find_plugin(pk: str, plugins: List[IndexPlugin]) -> Optional[IndexPlugin]:
+def find_plugin(pk: str, plugins: List[IndexPlugin]) -> Optional[IndexPlugin]:
     """按 key 或 name 查找插件"""
     for p in plugins:
         if p.get("key", "") == pk or p.get("name", "") == pk:
@@ -83,7 +83,7 @@ def _find_plugin(pk: str, plugins: List[IndexPlugin]) -> Optional[IndexPlugin]:
     return None
 
 
-def _find_command(cn: str, pinfo: IndexPlugin) -> Optional[dict]:
+def find_command(cn: str, pinfo: IndexPlugin) -> Optional[dict]:
     """在插件中按命令名查找命令"""
     for cmd in pinfo.get("commands", []):
         if cmd.get("command", "") == cn:
