@@ -23,6 +23,11 @@ FILTER_TYPE_TAGS: Dict[str, str] = {
 
 LOG_LEVEL_MAP = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
 
+# ── LLM 确认/拒绝响应短语 ─────────────────────────
+
+CONFIRM_PHRASES = frozenset({"确认", "是", "yes", "y", "ok", "好", "是的"})
+REJECT_PHRASES = frozenset({"拒绝", "不", "no", "n", "算了", "不是", "换一个", "换"})
+
 # ── LLM 路由参数 ─────────────────────────────────
 
 LLM_TEMPERATURE = 0.1          # 路由 LLM 温度

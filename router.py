@@ -1,25 +1,19 @@
-"""LLM 命令路由 + 命令自动执行
+"""LLM 命令路由
 
 路由逻辑：
 1. 从 command_index.json 读取结构化命令索引
 2. 将索引文本发送给 LLM，匹配到具体命令（插件名 + 命令名 + 参数）
 3. 根据执行模式（auto/confirm）决定是否自动执行
-
-命令执行：
-- 通过事件队列注入模拟用户发送命令
-- 参考 AstrBot 内置插件的 copy + put_nowait 模式
 """
 
-import copy
 import re
 from typing import Dict, List, Optional, Tuple
 
 from astrbot.api import logger
-from astrbot.core.message.components import Plain
 
-from .matcher import _find_command, _find_plugin, _match_command, _match_plugin
+from .matcher import find_command, find_plugin, match_command, match_plugin
 from .models import MAX_FULL_PROXY_CHARS, MAX_INDEX_CHARS, LLM_TEMPERATURE, IndexPlugin
-from .parser import _extract_response_text
+from .parser import extract_response_text
 from .prompts import _FULL_PROXY_PROMPT, _REVIEW_PROMPT, _ROUTE_PROMPT, _TOPN_REFINE_PROMPT
 
 
@@ -169,7 +163,7 @@ async def llm_resolve(
     try:
         # ── 第一步：粗筛 TOP-N 候选 ──
         resp = await provider.text_chat(prompt, temperature=LLM_TEMPERATURE)
-        raw = _extract_response_text(resp)
+        raw = extract_response_text(resp)
         if not raw:
             return None
 
@@ -200,7 +194,7 @@ async def llm_resolve(
         )
 
         resp2 = await provider.text_chat(refine_prompt, temperature=LLM_TEMPERATURE)
-        raw2 = _extract_response_text(resp2)
+        raw2 = extract_response_text(resp2)
         if not raw2:
             logger.debug("TOP-N 第二步未返回结果，使用第一步首个候选")
             return candidates[0]
@@ -221,7 +215,7 @@ async def llm_resolve(
             )
 
             resp3 = await provider.text_chat(review_prompt, temperature=LLM_TEMPERATURE)
-            raw3 = _extract_response_text(resp3)
+            raw3 = extract_response_text(resp3)
             if raw3:
                 review_result = raw3.strip()
                 if review_result.upper().startswith("CORRECT"):
@@ -286,10 +280,10 @@ def _format_candidates(candidates: List[RouteResult], plugins: List[IndexPlugin]
     """将候选列表格式化为带详细信息的文本，供 LLM 精选"""
     details: List[str] = []
     for i, (pk, cn, _, _) in enumerate(candidates, 1):
-        pinfo = _find_plugin(pk, plugins)
+        pinfo = find_plugin(pk, plugins)
         pdesc = pinfo.get("description", "") if pinfo else ""
 
-        cmd_info = _find_command(cn, pinfo) if pinfo and cn else None
+        cmd_info = find_command(cn, pinfo) if pinfo and cn else None
 
         # 构建展示
         display = pinfo.get("name", pk) if pinfo else pk
@@ -315,11 +309,11 @@ def _format_selection_for_review(
     """将选中的命令格式化为详细信息，供自校对步骤使用"""
     pk, cn, args, msg = selection
 
-    pinfo = _find_plugin(pk, plugins)
+    pinfo = find_plugin(pk, plugins)
     display = pinfo.get("name", pk) if pinfo else pk
     lines = [f"插件: {display}"]
 
-    cmd_info = _find_command(cn, pinfo) if pinfo and cn else None
+    cmd_info = find_command(cn, pinfo) if pinfo and cn else None
 
     cmd_str = cn if cn else "-"
     if args:
@@ -346,10 +340,10 @@ def _check_and_fix_mismatch(
     pk, cn, args, msg = result
 
     # 找到选中命令的功能描述
-    pinfo = _find_plugin(pk, plugins)
+    pinfo = find_plugin(pk, plugins)
     if not pinfo:
         return result
-    cmd_info = _find_command(cn, pinfo)
+    cmd_info = find_command(cn, pinfo)
     if not cmd_info:
         return result
     desc = cmd_info.get("description", "")
@@ -386,10 +380,10 @@ def _check_and_fix_mismatch(
     for alt_pk, alt_cn, alt_args, alt_msg in candidates:
         if alt_cn == cn and alt_pk == pk:
             continue
-        alt_pinfo = _find_plugin(alt_pk, plugins)
+        alt_pinfo = find_plugin(alt_pk, plugins)
         if not alt_pinfo:
             continue
-        alt_cmd = _find_command(alt_cn, alt_pinfo)
+        alt_cmd = find_command(alt_cn, alt_pinfo)
         alt_desc = alt_cmd.get("description", "") if alt_cmd else ""
         # 替代命令的描述不包含同样的否定短语 → 可用
         if not any(phrase in alt_desc for phrase in conflict_phrases):
@@ -411,8 +405,8 @@ def _is_excluded(result: RouteResult, exclude: List[str]) -> bool:
 
 def _resolve_plugin_display(plugin_part: str, plugins: List[IndexPlugin]) -> Tuple[str, str]:
     """将 LLM 返回的插件名解析为 (found_key, display_name)。"""
-    cache_key = _match_plugin(plugin_part, plugins)
-    pinfo = _find_plugin(cache_key or plugin_part, plugins)
+    cache_key = match_plugin(plugin_part, plugins)
+    pinfo = find_plugin(cache_key or plugin_part, plugins)
     if pinfo:
         return pinfo.get("key", "") or pinfo.get("name", ""), pinfo.get("name", plugin_part)
     return cache_key or plugin_part, plugin_part
@@ -440,16 +434,16 @@ def _parse_single_route_line(
         parts = [p.strip() for p in raw.split("\t")]
     if len(parts) < 4:
         # 只有插件名
-        cache_key = _match_plugin(parts[0], plugins)
+        cache_key = match_plugin(parts[0], plugins)
         if cache_key:
-            pinfo = _find_plugin(cache_key, plugins)
+            pinfo = find_plugin(cache_key, plugins)
             display = pinfo.get("name", cache_key) if pinfo else cache_key
             return (cache_key, "-", "", f"找到插件 **{display}**，将展示其所有命令")
         return None
 
     plugin_part, cmd_part, args_part, msg_part = parts[0], parts[1], parts[2], parts[3]
 
-    cache_key = _match_plugin(plugin_part, plugins)
+    cache_key = match_plugin(plugin_part, plugins)
     found_key, display = _resolve_plugin_display(plugin_part, plugins)
 
     if not cache_key:
@@ -463,7 +457,7 @@ def _parse_single_route_line(
 
     if cmd_name:
         # 验证命令是否存在（用 key 或 name 匹配插件）
-        matched = _match_command(cmd_name, found_key, plugins)
+        matched = match_command(cmd_name, found_key, plugins)
         if matched:
             confirm = msg_part or f"匹配到 **{display}** 的 `{matched}` 命令"
             return (found_key, matched, args_str, confirm)
@@ -500,7 +494,7 @@ async def llm_resolve_all(
 
     try:
         resp = await provider.text_chat(prompt, temperature=LLM_TEMPERATURE)
-        raw = _extract_response_text(resp)
+        raw = extract_response_text(resp)
         if not raw:
             return None
         return _parse_full_proxy_result(raw, plugins)
@@ -548,7 +542,7 @@ def _parse_full_proxy_result(
 
     if action == "EXEC" and cmd_name:
         # 验证命令
-        matched = _match_command(cmd_name, found_key, plugins)
+        matched = match_command(cmd_name, found_key, plugins)
         if matched:
             return (action, found_key, matched, args_str,
                     msg_part or f"将执行 **{display}** 的 `{matched}` 命令")
@@ -562,37 +556,3 @@ def _parse_full_proxy_result(
 
     return (action, found_key, cmd_name, args_str,
             msg_part or f"匹配到 **{display}**")
-
-
-# ── 命令自动执行 ──────────────────────────────────
-
-
-def execute_command(event, command_name: str, args_str: str, context) -> bool:
-    """
-    模拟用户发送命令，通过事件队列注入来自动执行。
-    参考 AstrBot 内置插件的 copy + put_nowait 模式。
-
-    command_name: 命令名（不带 /），如 "天气"
-    args_str: 参数，如 "北京"
-    """
-    try:
-        cmd_text = f"/{command_name}"
-        if args_str:
-            cmd_text += f" {args_str}"
-
-        new_event = copy.copy(event)
-        new_event.message_str = cmd_text
-        new_event.message_obj.message_str = cmd_text
-        new_event.message_obj.message = [Plain(cmd_text)]
-        new_event.is_wake = True
-        new_event.is_at_or_wake_command = True
-        new_event.clear_result()
-        new_event._force_stopped = False
-
-        context.get_event_queue().put_nowait(new_event)
-        logger.info(f"事件队列注入: {cmd_text}")
-        return True
-
-    except Exception:
-        logger.exception("命令执行注入失败")
-        return False

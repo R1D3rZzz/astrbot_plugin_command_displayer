@@ -126,7 +126,7 @@ async def _parse_with_llm(
             prompt=_PROMPT_TEMPLATE.format(content=content),
             session_id="command_displayer_scan",
         )
-        resp_str = _extract_response_text(resp)
+        resp_str = extract_response_text(resp)
         if not resp_str:
             logger.debug(f"LLM 返回空内容: {plugin_dir_name}")
             return None
@@ -146,7 +146,7 @@ async def _parse_with_llm(
 # ── 响应解析 ──────────────────────────────────────
 
 
-def _extract_response_text(resp) -> Optional[str]:
+def extract_response_text(resp) -> Optional[str]:
     """从 LLMResponse 对象中提取文本内容"""
     if not resp:
         return None

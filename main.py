@@ -16,9 +16,13 @@ from astrbot.api.star import Context, Star
 
 from .cache import CommandCache
 from .formatter import format_all, format_plugin, format_plugin_list
-from .models import DEFAULT_CACHE_TIMEOUT, DEFAULT_SCAN_INTERVAL, LLM_CONFIRM_TIMEOUT, LOG_LEVEL_MAP, MAX_README_SIZE
+from .models import (
+    CONFIRM_PHRASES, DEFAULT_CACHE_TIMEOUT, DEFAULT_SCAN_INTERVAL,
+    LLM_CONFIRM_TIMEOUT, LOG_LEVEL_MAP, MAX_README_SIZE, REJECT_PHRASES,
+)
 from .rejection import RejectionStore
-from .router import execute_command, llm_resolve, llm_resolve_all
+from .executor import execute_command
+from .router import llm_resolve, llm_resolve_all
 from .scanner import PluginScanner
 
 _CMD_USAGE = (
@@ -136,6 +140,22 @@ class CommandDisplayer(Star):
             pname, _, _, _ = result
             return pname if pname != "__list_all__" else None
         return None
+
+    # ── 命令执行辅助 ──────────────────────────────
+
+    def _try_execute(
+        self, event: AstrMessageEvent, command_name: str, args_str: str, context_msg: str
+    ) -> str:
+        """尝试执行命令，返回结果文本"""
+        cmd_trigger = command_name.lstrip("/")
+        exec_cmd = f"{cmd_trigger} {args_str}".strip()
+        success = execute_command(event, cmd_trigger, args_str, self.context)
+        if success:
+            prefix = f"{context_msg}\n" if context_msg else ""
+            return f"✅ {prefix}正在执行 `/{exec_cmd}`..."
+        else:
+            prefix = f"{context_msg}\n" if context_msg else ""
+            return f"⚠️ {prefix}执行失败，请手动发送：`/{exec_cmd}`"
 
     # ── /帮助 ──────────────────────────────────────
 
@@ -313,14 +333,8 @@ class CommandDisplayer(Star):
 
         if action == "EXEC":
             if command_name:
-                cmd_trigger = command_name.lstrip("/")
-                exec_cmd = f"{cmd_trigger} {args_str}".strip()
-                logger.info(f"LLM 全权代理执行: /{exec_cmd}")
-                success = execute_command(event, cmd_trigger, args_str, self.context)
-                if success:
-                    return f"✅ {msg}\n正在执行 `/{exec_cmd}`..."
-                else:
-                    return f"⚠️ {msg}\n执行失败，请手动发送：`/{exec_cmd}`"
+                logger.info(f"LLM 全权代理执行: /{command_name.lstrip('/')}")
+                return self._try_execute(event, command_name, args_str, msg)
             else:
                 pinfo = data.get(plugin_name)
                 if pinfo:
@@ -358,16 +372,8 @@ class CommandDisplayer(Star):
         # ── auto 模式：直接执行 ──
         if self.llm_execute_mode == "auto":
             if command_name and command_name != "-":
-                cmd_trigger = command_name.lstrip("/")
-                exec_cmd = f"{cmd_trigger} {args_str}".strip()
-
-                logger.info(f"LLM auto 执行: /{exec_cmd}")
-                success = execute_command(event, cmd_trigger, args_str, self.context)
-
-                if success:
-                    return f"✅ {detail}\n正在执行 `/{exec_cmd}`..."
-                else:
-                    return f"⚠️ {detail}\n执行失败，请手动发送：`/{exec_cmd}`"
+                logger.info(f"LLM auto 执行: /{command_name.lstrip('/')}")
+                return self._try_execute(event, command_name, args_str, detail)
             elif pinfo:
                 return format_plugin(plugin_name, pinfo, self.max_commands_per_plugin, self.command_format)
             else:
@@ -399,11 +405,23 @@ class CommandDisplayer(Star):
 
     # ── LLM 确认监听器 ─────────────────────────────
 
+    def _sweep_pending_llm(self):
+        """清理过期的 LLM 待确认条目"""
+        now = time.time()
+        expired = [
+            k for k, v in self._pending_llm.items()
+            if now - v["timestamp"] > LLM_CONFIRM_TIMEOUT
+        ]
+        for k in expired:
+            del self._pending_llm[k]
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def llm_pending_listener(self, event: AstrMessageEvent):
         """监听所有消息，处理 LLM 路由的确认/拒绝"""
         if not self._pending_llm:
             return
+
+        self._sweep_pending_llm()
 
         sender_id = event.get_sender_id() or event.get_session_id()
         if not sender_id:
@@ -420,7 +438,7 @@ class CommandDisplayer(Star):
         resp = (event.get_message_str() if hasattr(event, "get_message_str") else "").strip().lower()
 
         # 确认：执行命令
-        if resp in ("确认", "是", "yes", "y", "ok", "好", "是的"):
+        if resp in CONFIRM_PHRASES:
             del self._pending_llm[sender_id]
 
             plugin_name = pending["plugin_name"]
@@ -428,16 +446,8 @@ class CommandDisplayer(Star):
             args_str = pending.get("args", "")
 
             if command_name and command_name != "-":
-                cmd_trigger = command_name.lstrip("/")
-                exec_cmd = f"{cmd_trigger} {args_str}".strip()
-
-                logger.info(f"LLM confirm 执行: /{exec_cmd}")
-                success = execute_command(event, cmd_trigger, args_str, self.context)
-
-                if success:
-                    yield event.plain_result(f"✅ 正在执行 `/{exec_cmd}`...")
-                else:
-                    yield event.plain_result(f"⚠️ 执行失败，请手动发送：`/{exec_cmd}`")
+                logger.info(f"LLM confirm 执行: /{command_name.lstrip('/')}")
+                yield event.plain_result(self._try_execute(event, command_name, args_str, ""))
             else:
                 pinfo = self.cache.commands.get(plugin_name)
                 if pinfo:
@@ -450,7 +460,7 @@ class CommandDisplayer(Star):
             return
 
         # 拒绝：记录并重新匹配
-        if resp in ("拒绝", "不", "no", "n", "算了", "不是", "换一个", "换"):
+        if resp in REJECT_PHRASES:
             del self._pending_llm[sender_id]
 
             plugin_name = pending["plugin_name"]

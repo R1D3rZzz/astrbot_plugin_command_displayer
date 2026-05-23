@@ -208,7 +208,7 @@ class PluginScanner:
                 args_desc = cmd.get("args_description", "").strip()
                 if not args_desc and args_str:
                     # 兜底：从 args 简单生成描述
-                    args_desc = _brief_args_desc(args_str)
+                    args_desc = brief_args_desc(args_str)
                 commands.append(IndexCommand(
                     command=cmd.get("command", ""),
                     args=args_str,
@@ -224,7 +224,7 @@ class PluginScanner:
                 commands=commands,
             ))
 
-        self_index = _self_plugin_index()
+        self_index = self_plugin_index()
         # 动态查找本插件在缓存中的 key
         for pname, pinfo in data.items():
             if pinfo.get("name") == "Command Displayer" or "command_displayer" in pname.lower():
@@ -333,7 +333,7 @@ class PluginScanner:
             return None
 
 
-def _self_plugin_index() -> IndexPlugin:
+def self_plugin_index() -> IndexPlugin:
     """
     构建本插件自身的命令索引，追加到 command_index.json 中。
     参数定义与 main.py 中 @filter.command 装饰的 handler 签名保持一致。
@@ -395,7 +395,7 @@ def _self_plugin_index() -> IndexPlugin:
     )
 
 
-def _brief_args_desc(args_str: str) -> str:
+def brief_args_desc(args_str: str) -> str:
     """从参数字符串生成简要描述（兜底用，优先使用 handler_params 或 LLM 解析的结果）"""
     if not args_str:
         return "无参数"
