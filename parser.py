@@ -65,13 +65,19 @@ _PROMPT_TEMPLATE = (
     "你是一个 AstrBot 插件信息提取助手。请从以下 README 中精确提取插件信息。\n"
     "\n"
     "【提取要求】\n"
-    "1. plugin_name: 插件名称（取最精简的名称）\n"
-    "2. description: 插件功能描述（一句话概括，不超过100字）\n"
+    "1. plugin_name: 插件名称（取最精简的中文名称，不要带版本号或特殊符号）\n"
+    "2. description: 插件功能描述（20-100字，概括插件的核心功能和用途，要具体而非笼统）\n"
     "3. commands: 所有用户可触发的命令列表，每条包含：\n"
-    "   - command: 命令本身（如 /天气、/help）\n"
-    "   - args: 参数说明，格式如 [城市名] [日期] 或 [-s] [-d] [-t]，无参数则留空\n"
-    "   - args_description: 每个参数的功能说明，用分号分隔，如：城市名: 要查询的城市; 日期: 查询日期，默认为今天\n"
-    "   - description: 命令功能说明\n"
+    "   - command: 命令本身（如 /天气、/help，必须以 / 开头）\n"
+    "   - args: 参数说明，格式如 [城市名] [日期] 或 [-s] [-d] [-t]，无参数则留空字符串\n"
+    "   - args_description: 每个参数的功能说明，用分号分隔，如：城市名: 要查询的城市，必填; 日期: 查询日期，默认为今天\n"
+    "   - description: 命令功能说明（15-80字，具体说明该命令做什么、怎么用）\n"
+    "\n"
+    "【描述质量要求】\n"
+    "- 插件描述要具体：说明插件提供什么功能、解决什么问题，不要写\"这是一个xxx插件\"\n"
+    "- 命令描述要包含动作和对象：如\"查询指定城市的实时天气信息\"而非\"查看天气\"\n"
+    "- 如果 README 中有命令的详细用法说明，请提炼到 description 中\n"
+    "- 避免\"无描述\"或空描述，即使 README 信息有限也要根据命令名合理推断\n"
     "\n"
     "【参数识别规则】\n"
     "- 必填参数：用 [参数名] 表示，如 [城市名]、[插件名]\n"
@@ -79,29 +85,30 @@ _PROMPT_TEMPLATE = (
     "- 布尔 flag：用 [-字母] 表示，如 -s（简洁模式）、-d（详细模式）、-t（表格模式）、-v（verbose）\n"
     "- 混合参数：如 [subcmd] [-s|-d|-t]，表示一个必填子命令加可选格式 flag\n"
     "- 如果 README 中参数以 --option 形式出现（如 --help），也提取为 [-option]\n"
-    "- 无参数的命令，args 和 args_description 都留空\n"
+    "- 无参数的命令，args 和 args_description 都留空字符串\n"
     "\n"
     "【注意事项】\n"
     "- 只提取用户在聊天中可直接触发的命令（通常以 / 开头）\n"
-    "- 不要提取内部函数名、API 端点、开发相关命令\n"
+    "- 不要提取内部函数名、API 端点、开发相关命令、配置项\n"
     "- 命令必须以 / 开头，如果不带 / 请补上\n"
     "- 别名(aliases)也作为独立命令条目列出\n"
     "- 如果 README 中只有功能描述没有明确命令，commands 留空数组\n"
+    "- 正则过滤器命令用 正则:模式 格式表示\n"
     "\n"
     "【输出格式】\n"
     "只输出合法 JSON，不要任何解释、不要 markdown 代码块。\n"
     "\n"
-    "示例（含多种参数格式）：\n"
-    '{{"plugin_name":"天气查询","description":"查询城市天气",'
+    "示例（含多种参数格式和高质量描述）：\n"
+    '{{"plugin_name":"天气查询","description":"提供城市天气查询服务，支持实时天气、未来预报和多城市对比",'
     '"commands":['
-    '{{"command":"/天气","args":"[城市名]","args_description":"城市名: 要查询的城市，必填","description":"查询指定城市天气"}},'
-    '{{"command":"/forecast","args":"[城市名] [天数]","args_description":"城市名: 要查询的城市，必填; 天数: 预报天数，默认3天","description":"查询未来几天天气预报"}},'
-    '{{"command":"/weather","args":"[-s] [-d] [-t]","args_description":"-s: 简洁模式; -d: 详细模式，默认; -t: 表格模式","description":"查看天气信息，支持格式参数"}},'
-    '{{"command":"/help","args":"","args_description":"","description":"显示帮助信息"}}'
+    '{{"command":"/天气","args":"[城市名]","args_description":"城市名: 要查询的城市名称，必填，如：北京、上海","description":"查询指定城市的实时天气信息，包括温度、湿度、风力等"}},'
+    '{{"command":"/forecast","args":"[城市名] [天数]","args_description":"城市名: 要查询的城市，必填; 天数: 预报天数，默认3天，最大7天","description":"查询指定城市未来几天的天气预报趋势"}},'
+    '{{"command":"/weather","args":"[-s] [-d] [-t]","args_description":"-s: 简洁模式，只显示温度; -d: 详细模式，显示全部信息，默认; -t: 表格模式","description":"查看天气信息，支持多种输出格式参数"}},'
+    '{{"command":"/help","args":"","args_description":"","description":"显示天气插件的帮助信息，包含所有可用命令的说明"}}'
     ']}}\n'
     "\n"
     "无命令时：\n"
-    '{{"plugin_name":"示例插件","description":"这是一个示例","commands":[]}}\n'
+    '{{"plugin_name":"示例插件","description":"这是一个功能示例插件，用于演示插件开发规范","commands":[]}}\n'
     "\n"
     "【README 内容】\n{content}"
 )
